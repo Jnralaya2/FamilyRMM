@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
-import { createHash, randomBytes, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { createHash, createPublicKey, generateKeyPairSync, randomBytes, scrypt as scryptCallback, sign as cryptoSign, timingSafeEqual, verify as cryptoVerify } from "node:crypto";
 import { promisify } from "node:util";
-import { mkdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
@@ -76,7 +76,88 @@ db.exec(`
     detail TEXT,
     created_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS enrollment_policies (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    max_devices INTEGER NOT NULL,
+    expires_in_hours INTEGER NOT NULL,
+    approval_mode TEXT NOT NULL,
+    allowed_os_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES administrators(id),
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+  );
+  CREATE TABLE IF NOT EXISTS enrollment_grants (
+    id TEXT PRIMARY KEY,
+    policy_id TEXT NOT NULL REFERENCES enrollment_policies(id),
+    manifest_json TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    max_uses INTEGER NOT NULL,
+    used_count INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES administrators(id),
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+  );
+  CREATE TABLE IF NOT EXISTS enrollment_claims (
+    device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+    grant_id TEXT NOT NULL REFERENCES enrollment_grants(id),
+    client_nonce TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    reviewed_by TEXT,
+    reviewed_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS enrollment_claims_state_idx ON enrollment_claims(state, created_at);
+  CREATE TABLE IF NOT EXISTS agent_request_nonces (
+    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    nonce TEXT NOT NULL,
+    used_at INTEGER NOT NULL,
+    PRIMARY KEY(device_id, nonce)
+  );
 `);
+
+// Forward-only SQLite migrations keep existing local development databases usable.
+const deviceColumns = new Set(db.prepare("PRAGMA table_info(devices)").all().map((column) => column.name));
+if (!deviceColumns.has("device_public_key")) db.exec("ALTER TABLE devices ADD COLUMN device_public_key TEXT");
+if (!deviceColumns.has("enrollment_grant_id")) db.exec("ALTER TABLE devices ADD COLUMN enrollment_grant_id TEXT");
+if (!deviceColumns.has("enrollment_state")) db.exec("ALTER TABLE devices ADD COLUMN enrollment_state TEXT NOT NULL DEFAULT 'approved'");
+
+const serverUrl = (process.env.RMM_SERVER_URL || "http://127.0.0.1:3001").replace(/\/$/, "");
+if (process.env.RMM_ENV === "production") {
+  let configuredUrl;
+  try { configuredUrl = new URL(serverUrl); } catch { configuredUrl = null; }
+  if (!configuredUrl || configuredUrl.protocol !== "https:" || configuredUrl.username || configuredUrl.password || ["localhost", "127.0.0.1", "::1"].includes(configuredUrl.hostname)) {
+    console.error("RMM_SERVER_URL must be an HTTPS URL on a non-loopback host in production.");
+    process.exit(1);
+  }
+}
+let enrollmentPrivateKey;
+let enrollmentPublicKey;
+if (process.env.RMM_ENROLLMENT_PRIVATE_KEY) {
+  enrollmentPrivateKey = process.env.RMM_ENROLLMENT_PRIVATE_KEY.replace(/\\n/g, "\n");
+  enrollmentPublicKey = createPublicKey(enrollmentPrivateKey).export({ format: "pem", type: "spki" }).toString();
+} else if (process.env.RMM_ENV === "production") {
+  console.error("RMM_ENROLLMENT_PRIVATE_KEY must be supplied from protected secret storage in production.");
+  process.exit(1);
+} else {
+  const signingPath = path.join(path.dirname(dataPath), "dev-enrollment-signing-key.pem");
+  try {
+    enrollmentPrivateKey = await readFile(signingPath, "utf8");
+  } catch {
+    const pair = generateKeyPairSync("ed25519", { privateKeyEncoding: { format: "pem", type: "pkcs8" }, publicKeyEncoding: { format: "pem", type: "spki" } });
+    enrollmentPrivateKey = pair.privateKey;
+    try { await writeFile(signingPath, enrollmentPrivateKey, { flag: "wx", mode: 0o600 }); }
+    catch { enrollmentPrivateKey = await readFile(signingPath, "utf8"); }
+  }
+  enrollmentPublicKey = createPublicKey(enrollmentPrivateKey).export({ format: "pem", type: "spki" }).toString();
+}
+const canonicalJson = (value) => {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+};
+const signManifest = (manifest) => cryptoSign(null, Buffer.from(canonicalJson(manifest)), enrollmentPrivateKey).toString("base64url");
 
 const counts = db.prepare("SELECT COUNT(*) AS n FROM administrators").get();
 let setupToken = null;
@@ -151,6 +232,40 @@ async function readBody(req) {
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
+async function readRawBody(req, maxBytes = 64 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxBytes) throw new Error("Request body is too large.");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+function parseRawJson(raw) {
+  try { return JSON.parse(raw.toString("utf8") || "{}"); } catch { return null; }
+}
+function authenticateAgentRequest(req, raw, res) {
+  const deviceId = String(req.headers["x-device-id"] || "");
+  const timestamp = String(req.headers["x-device-timestamp"] || "");
+  const nonce = String(req.headers["x-device-nonce"] || "");
+  const signature = String(req.headers["x-device-signature"] || "");
+  if (!/^[A-Fa-f0-9-]{16,64}$/.test(deviceId) || !/^\d{10,16}$/.test(timestamp) || !/^[A-Za-z0-9_-]{20,120}$/.test(nonce) || signature.length > 256) {
+    send(res, 401, { error: "Invalid agent authentication." }); return null;
+  }
+  const timestampMs = Number(timestamp);
+  if (!Number.isSafeInteger(timestampMs) || Math.abs(Date.now() - timestampMs) > 60_000) { send(res, 401, { error: "Agent request expired." }); return null; }
+  const device = db.prepare("SELECT id, device_public_key, revoked_at, enrollment_state FROM devices WHERE id=?").get(deviceId);
+  if (!device || device.revoked_at || device.enrollment_state !== "approved" || !device.device_public_key) { send(res, 403, { error: "This device is not authorized." }); return null; }
+  const message = Buffer.concat([Buffer.from(`${timestamp}\n${nonce}\n`), raw]);
+  let valid = false;
+  try { valid = cryptoVerify(null, message, device.device_public_key, Buffer.from(signature, "base64url")); } catch { valid = false; }
+  if (!valid) { send(res, 401, { error: "Agent signature is invalid." }); return null; }
+  try { db.prepare("INSERT INTO agent_request_nonces(device_id, nonce, used_at) VALUES(?,?,?)").run(deviceId, nonce, Date.now()); }
+  catch { send(res, 409, { error: "Agent request nonce has already been used." }); return null; }
+  db.prepare("DELETE FROM agent_request_nonces WHERE used_at < ?").run(Date.now() - 10 * 60_000);
+  return device;
+}
 function requireAdmin(req, res) {
   const session = currentSession(req);
   if (!session) { send(res, 401, { error: "Sign in to continue." }); return null; }
@@ -183,7 +298,7 @@ function deviceView(row) {
     memoryUsagePercent: row.memory_percent ?? null,
     lastSeen: row.last_seen,
     enrolledAt: row.enrolled_at,
-    status: row.revoked_at ? "Revoked" : isOnline(row.last_seen) ? "Online" : "Offline",
+    status: row.revoked_at ? "Revoked" : row.enrollment_state === "pending" ? "Pending approval" : row.enrollment_state === "rejected" ? "Rejected" : isOnline(row.last_seen) ? "Online" : "Offline",
   };
 }
 
@@ -269,6 +384,130 @@ async function api(req, res, url) {
     return;
   }
 
+  if (route === "/api/enrollment/public-key" && req.method === "GET") {
+    send(res, 200, { algorithm: "Ed25519", publicKey: enrollmentPublicKey, serverUrl });
+    return;
+  }
+  if (route === "/api/agent/enroll" && req.method === "POST") {
+    let body;
+    try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid enrollment request." }); return; }
+    const grant = body.enrollmentGrant;
+    const manifest = grant?.manifest;
+    const signature = typeof grant?.signature === "string" ? grant.signature : "";
+    if (!manifest || typeof manifest !== "object" || signature.length > 256) { send(res, 400, { error: "A signed enrollment grant is required." }); return; }
+    let signatureValid = false;
+    try { signatureValid = cryptoVerify(null, Buffer.from(canonicalJson(manifest)), enrollmentPublicKey, Buffer.from(signature, "base64url")); } catch { signatureValid = false; }
+    if (!signatureValid) { send(res, 403, { error: "Enrollment grant signature is invalid." }); return; }
+    if (manifest.version !== 1 || manifest.serverUrl !== serverUrl || manifest.audience !== serverUrl || typeof manifest.grantId !== "string" || typeof manifest.policyId !== "string") {
+      send(res, 403, { error: "Enrollment grant is for a different server or policy." }); return;
+    }
+    const grantRow = db.prepare("SELECT * FROM enrollment_grants WHERE id=?").get(manifest.grantId);
+    const policy = db.prepare("SELECT * FROM enrollment_policies WHERE id=?").get(manifest.policyId);
+    if (!grantRow || !policy || grantRow.policy_id !== policy.id || grantRow.revoked_at || policy.revoked_at) { send(res, 403, { error: "Enrollment grant or policy has been revoked." }); return; }
+    if (Date.parse(grantRow.expires_at) <= Date.now() || Date.parse(manifest.expiresAt) <= Date.now()) { send(res, 410, { error: "Enrollment grant has expired." }); return; }
+    if (grantRow.manifest_json !== canonicalJson(manifest) || grantRow.signature !== signature || manifest.maxUses !== grantRow.max_uses) { send(res, 403, { error: "Enrollment grant does not match the server record." }); return; }
+    const deviceId = typeof body.deviceId === "string" ? body.deviceId : "";
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const os = typeof body.operatingSystem === "string" ? body.operatingSystem.trim() : "";
+    const publicKeyPem = typeof body.devicePublicKey === "string" ? body.devicePublicKey : "";
+    const clientNonce = typeof body.clientNonce === "string" ? body.clientNonce : "";
+    const clientTimestamp = Number(body.timestamp);
+    const proof = typeof body.proofSignature === "string" ? body.proofSignature : "";
+    let publicKey;
+    try { publicKey = createPublicKey(publicKeyPem); } catch { publicKey = null; }
+    if (!/^[A-Fa-f0-9-]{16,64}$/.test(deviceId) || !name || name.length > 200 || !os || os.length > 120 || !publicKey || publicKey.asymmetricKeyType !== "ed25519" || publicKeyPem.length > 4096 || !/^[A-Za-z0-9_-]{20,120}$/.test(clientNonce) || !Number.isSafeInteger(clientTimestamp) || Math.abs(Date.now() - clientTimestamp) > 5 * 60_000) {
+      send(res, 400, { error: "Device identity or installation details are invalid." }); return;
+    }
+    const allowedOS = JSON.parse(policy.allowed_os_json);
+    if (allowedOS.length && !allowedOS.some((allowed) => os.toLowerCase().includes(allowed.toLowerCase()))) { send(res, 403, { error: "This operating system is not allowed by the enrollment policy." }); return; }
+    const proofMessage = Buffer.from(`${manifest.grantId}\n${deviceId}\n${clientTimestamp}\n${clientNonce}`);
+    let proofValid = false;
+    try { proofValid = cryptoVerify(null, proofMessage, publicKey, Buffer.from(proof, "base64url")); } catch { proofValid = false; }
+    if (!proofValid) { send(res, 401, { error: "Device key proof is invalid." }); return; }
+
+    const existing = db.prepare("SELECT * FROM devices WHERE id=?").get(deviceId);
+    if (existing) {
+      if (existing.enrollment_grant_id === grantRow.id && existing.device_public_key === publicKeyPem && !existing.revoked_at) {
+        send(res, existing.enrollment_state === "pending" ? 202 : 200, { deviceId, status: existing.enrollment_state, idempotent: true }); return;
+      }
+      send(res, 409, { error: "This device identity has already been used." }); return;
+    }
+    const mode = policy.approval_mode;
+    const state = mode === "approval" ? "pending" : "approved";
+    if (grantRow.used_count >= grantRow.max_uses) { send(res, 409, { error: "This enrollment grant has reached its device limit." }); return; }
+    const now = new Date().toISOString();
+    const insertDevice = db.prepare(`INSERT INTO devices(id,name,operating_system,os_version,architecture,ip_addresses,agent_version,last_seen,enrolled_at,device_public_key,enrollment_grant_id,enrollment_state)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+    const createClaim = db.prepare("INSERT INTO enrollment_claims(device_id,grant_id,client_nonce,state,created_at) VALUES(?,?,?,?,?)");
+    const reserveGrant = db.prepare("UPDATE enrollment_grants SET used_count=used_count+1 WHERE id=? AND used_count < max_uses AND revoked_at IS NULL");
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const reserved = reserveGrant.run(grantRow.id);
+      if (reserved.changes !== 1) { db.exec("ROLLBACK"); send(res, 409, { error: "This enrollment grant has reached its device limit." }); return; }
+      insertDevice.run(deviceId, name, os, String(body.osVersion || "").slice(0, 120), String(body.architecture || "").slice(0, 64), "[]", String(body.agentVersion || "").slice(0, 80), null, now, publicKeyPem, grantRow.id, state);
+      createClaim.run(deviceId, grantRow.id, clientNonce, state, now);
+      audit(state === "approved" ? "agent.enrollment_approved" : "agent.enrollment_pending", null, deviceId, JSON.stringify({ grantId: grantRow.id, policyId: policy.id }));
+      db.exec("COMMIT");
+    } catch {
+      try { db.exec("ROLLBACK"); } catch { /* The transaction may already be closed. */ }
+      send(res, 409, { error: "Enrollment could not be recorded." }); return;
+    }
+    send(res, state === "pending" ? 202 : 201, { deviceId, status: state, checkInAllowed: state === "approved" });
+    return;
+  }
+  if ((route === "/api/agent/heartbeat" || route === "/api/agent/inventory") && req.method === "POST") {
+    let raw;
+    try { raw = await readRawBody(req, route.endsWith("inventory") ? 1024 * 1024 : 64 * 1024); } catch { send(res, 413, { error: "Agent report is too large." }); return; }
+    const body = parseRawJson(raw);
+    if (!body || typeof body !== "object") { send(res, 400, { error: "Invalid agent report." }); return; }
+    const device = authenticateAgentRequest(req, raw, res);
+    if (!device) return;
+    if (route === "/api/agent/heartbeat") {
+      const name = typeof body.name === "string" ? body.name.trim() : "";
+      if (name && name.length > 200) { send(res, 400, { error: "Device name is too long." }); return; }
+      const safePercent = (n) => Number.isFinite(n) && n >= 0 && n <= 100 ? n : null;
+      const now = new Date().toISOString();
+      db.prepare(`UPDATE devices SET name=COALESCE(NULLIF(?,''),name), operating_system=COALESCE(NULLIF(?,''),operating_system),
+        os_version=COALESCE(NULLIF(?,''),os_version), architecture=COALESCE(NULLIF(?,''),architecture), manufacturer=COALESCE(NULLIF(?,''),manufacturer),
+        model=COALESCE(NULLIF(?,''),model), cpu=COALESCE(NULLIF(?,''),cpu), cpu_cores=COALESCE(?,cpu_cores), total_memory_mb=COALESCE(?,total_memory_mb),
+        ip_addresses=COALESCE(?,ip_addresses), agent_version=COALESCE(NULLIF(?,''),agent_version), last_seen=? WHERE id=?`)
+        .run(name, String(body.operatingSystem || "").slice(0,120), String(body.osVersion || "").slice(0,120), String(body.architecture || "").slice(0,64),
+          String(body.manufacturer || "").slice(0,200), String(body.model || "").slice(0,200), String(body.cpu || "").slice(0,300),
+          Number.isInteger(body.cpuCores) && body.cpuCores > 0 && body.cpuCores <= 1024 ? body.cpuCores : null,
+          Number.isInteger(body.totalMemoryMB) && body.totalMemoryMB > 0 && body.totalMemoryMB <= 4_194_304 ? body.totalMemoryMB : null,
+          Array.isArray(body.ipAddresses) ? JSON.stringify(body.ipAddresses.filter((ip) => typeof ip === "string").slice(0,32).map((ip) => ip.slice(0,64))) : null,
+          String(body.agentVersion || "").slice(0,80), now, device.id);
+      const cpu = safePercent(body.metrics?.cpuPercent);
+      const memory = safePercent(body.metrics?.memoryPercent);
+      if (cpu !== null || memory !== null) {
+        const previous = db.prepare("SELECT recorded_at FROM metric_samples WHERE device_id=? ORDER BY recorded_at DESC LIMIT 1").get(device.id);
+        if (!previous || Date.now() - Date.parse(previous.recorded_at) >= 5000) {
+          db.prepare("INSERT INTO metric_samples(device_id,recorded_at,cpu_percent,memory_percent) VALUES(?,?,?,?)").run(device.id, now, cpu, memory);
+        }
+      }
+      send(res, 200, { ok: true, checkedInAt: now });
+      return;
+    }
+    const apps = body.software;
+    if (!Array.isArray(apps) || apps.length > 10000 || apps.some((app) => !app || typeof app.name !== "string" || app.name.length === 0 || app.name.length > 300)) {
+      send(res, 400, { error: "Software inventory is invalid." }); return;
+    }
+    const insertSoftware = db.prepare("INSERT INTO software_inventory(device_id,name,version,publisher,installed_at) VALUES(?,?,?,?,?)");
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      db.prepare("DELETE FROM software_inventory WHERE device_id=?").run(device.id);
+      for (const app of apps) insertSoftware.run(device.id, app.name, typeof app.version === "string" ? app.version.slice(0,120) : null,
+        typeof app.publisher === "string" ? app.publisher.slice(0,200) : null, typeof app.installedAt === "string" && !Number.isNaN(Date.parse(app.installedAt)) ? app.installedAt : null);
+      db.prepare("UPDATE devices SET last_seen=? WHERE id=?").run(new Date().toISOString(), device.id);
+      db.exec("COMMIT");
+    } catch {
+      try { db.exec("ROLLBACK"); } catch { /* The transaction may already be closed. */ }
+      send(res, 500, { error: "Software inventory could not be saved." }); return;
+    }
+    send(res, 200, { ok: true, applications: apps.length });
+    return;
+  }
+
   const session = requireAdmin(req, res);
   if (!session) return;
   if ((req.method === "POST" || req.method === "DELETE" || req.method === "PATCH") && !checkOrigin(req)) {
@@ -285,16 +524,134 @@ async function api(req, res, url) {
   if ((req.method === "POST" || req.method === "DELETE" || req.method === "PATCH") && !csrfValid(req, session)) {
     send(res, 403, { error: "Security token expired. Refresh and try again." }); return;
   }
+  const hasManagementRights = session.role === "owner" || session.role === "administrator";
+  if ((route.startsWith("/api/enrollment/") || route.startsWith("/api/installer-packages") || route.startsWith("/api/devices/")) && !hasManagementRights) {
+    send(res, 403, { error: "Your role cannot manage enrollment or devices." }); return;
+  }
+  if (route === "/api/enrollment/policies" && req.method === "GET") {
+    const policies = db.prepare(`SELECT p.id,p.name,p.max_devices AS maxDevices,p.expires_in_hours AS expiresInHours,p.approval_mode AS approvalMode,
+      p.allowed_os_json AS allowedOperatingSystems,p.created_at AS createdAt,p.revoked_at AS revokedAt,
+      (SELECT COUNT(*) FROM enrollment_grants g WHERE g.policy_id=p.id AND g.revoked_at IS NULL AND g.expires_at>?) AS activeGrants
+      FROM enrollment_policies p ORDER BY p.created_at DESC`).all(new Date().toISOString()).map((p) => ({ ...p, allowedOperatingSystems: JSON.parse(p.allowedOperatingSystems) }));
+    send(res, 200, { items: policies }); return;
+  }
+  if (route === "/api/enrollment/policies" && req.method === "POST") {
+    let body;
+    try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid policy request." }); return; }
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const maxDevices = Number(body.maxDevices);
+    const expiresInHours = Number(body.expiresInHours);
+    const approvalMode = body.approvalMode === "approval" ? "approval" : body.approvalMode === "automatic" ? "automatic" : "";
+    const operatingSystems = Array.isArray(body.allowedOperatingSystems) ? body.allowedOperatingSystems : ["Windows"];
+    if (!name || name.length > 100 || !Number.isInteger(maxDevices) || maxDevices < 1 || maxDevices > 10000 || !Number.isInteger(expiresInHours) || expiresInHours < 1 || expiresInHours > 8760 || !approvalMode || operatingSystems.length > 10 || operatingSystems.some((os) => typeof os !== "string" || os.trim().length < 2 || os.trim().length > 32)) {
+      send(res, 400, { error: "Enter a name, a device limit from 1 to 10,000, expiry from 1 to 8,760 hours, an approval mode and up to ten allowed OS values." }); return;
+    }
+    const id = randomBytes(16).toString("hex");
+    const now = new Date().toISOString();
+    db.prepare(`INSERT INTO enrollment_policies(id,name,max_devices,expires_in_hours,approval_mode,allowed_os_json,created_by,created_at)
+      VALUES(?,?,?,?,?,?,?,?)`).run(id, name, maxDevices, expiresInHours, approvalMode, JSON.stringify(operatingSystems.map((os) => os.trim())), session.id, now);
+    audit("enrollment.policy_created", session.id, id, JSON.stringify({ maxDevices, expiresInHours, approvalMode }));
+    send(res, 201, { id, name, maxDevices, expiresInHours, approvalMode, allowedOperatingSystems: operatingSystems, createdAt: now }); return;
+  }
+  const policyRevoke = route.match(/^\/api\/enrollment\/policies\/([a-f0-9]{32})\/revoke$/);
+  if (policyRevoke && req.method === "POST") {
+    const result = db.prepare("UPDATE enrollment_policies SET revoked_at=? WHERE id=? AND revoked_at IS NULL").run(new Date().toISOString(), policyRevoke[1]);
+    if (!result.changes) { send(res, 404, { error: "Policy not found or already revoked." }); return; }
+    db.prepare("UPDATE enrollment_grants SET revoked_at=? WHERE policy_id=? AND revoked_at IS NULL").run(new Date().toISOString(), policyRevoke[1]);
+    audit("enrollment.policy_revoked", session.id, policyRevoke[1]);
+    send(res, 200, { ok: true }); return;
+  }
+  const grantCollection = route === "/api/enrollment/grants";
+  if (grantCollection && req.method === "GET") {
+    const items = db.prepare(`SELECT g.id,g.policy_id AS policyId,p.name AS policyName,g.max_uses AS maxUses,g.used_count AS usedCount,
+      g.expires_at AS expiresAt,g.created_at AS createdAt,g.revoked_at AS revokedAt FROM enrollment_grants g
+      JOIN enrollment_policies p ON p.id=g.policy_id ORDER BY g.created_at DESC`).all();
+    send(res, 200, { items }); return;
+  }
+  const issueGrant = route.match(/^\/api\/enrollment\/policies\/([a-f0-9]{32})\/grants$/);
+  if (issueGrant && req.method === "POST") {
+    let body;
+    try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid grant request." }); return; }
+    let issued;
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const policy = db.prepare("SELECT * FROM enrollment_policies WHERE id=? AND revoked_at IS NULL").get(issueGrant[1]);
+      if (!policy) { db.exec("ROLLBACK"); send(res, 404, { error: "Active enrollment policy not found." }); return; }
+      const nowIso = new Date().toISOString();
+      const usage = db.prepare(`SELECT COALESCE(SUM(used_count),0) AS consumed,
+        COALESCE(SUM(CASE WHEN revoked_at IS NULL AND expires_at>? THEN max_uses-used_count ELSE 0 END),0) AS reserved
+        FROM enrollment_grants WHERE policy_id=?`).get(nowIso, policy.id);
+      const availablePolicySlots = Math.max(0, policy.max_devices - usage.consumed - usage.reserved);
+      const maxUses = body.maxUses === undefined ? availablePolicySlots : Number(body.maxUses);
+      const hours = body.expiresInHours === undefined ? policy.expires_in_hours : Number(body.expiresInHours);
+      if (!Number.isInteger(maxUses) || maxUses < 1 || maxUses > availablePolicySlots || !Number.isInteger(hours) || hours < 1 || hours > policy.expires_in_hours) {
+        db.exec("ROLLBACK"); send(res, 400, { error: `Grant limits must fit the policy. ${availablePolicySlots} enrollment slot(s) remain available.` }); return;
+      }
+      const id = randomBytes(16).toString("hex");
+      const createdAt = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + hours * 60 * 60_000).toISOString();
+      const manifest = { version: 1, grantId: id, policyId: policy.id, serverUrl, audience: serverUrl, issuedAt: createdAt, expiresAt,
+        maxUses, allowedOperatingSystems: JSON.parse(policy.allowed_os_json), approvalMode: policy.approval_mode };
+      const signature = signManifest(manifest);
+      db.prepare(`INSERT INTO enrollment_grants(id,policy_id,manifest_json,signature,max_uses,expires_at,created_by,created_at)
+        VALUES(?,?,?,?,?,?,?,?)`).run(id, policy.id, canonicalJson(manifest), signature, maxUses, expiresAt, session.id, createdAt);
+      audit("enrollment.grant_created", session.id, id, JSON.stringify({ policyId: policy.id, maxUses, expiresAt }));
+      db.exec("COMMIT");
+      issued = { id, policyId: policy.id, createdAt, expiresAt, maxUses, usedCount: 0, enrollmentGrant: { manifest, signature } };
+    } catch {
+      try { db.exec("ROLLBACK"); } catch { /* The transaction may already be closed. */ }
+      send(res, 500, { error: "Enrollment authorization could not be issued." }); return;
+    }
+    send(res, 201, issued); return;
+  }
+  const grantRevoke = route.match(/^\/api\/enrollment\/grants\/([a-f0-9]{32})\/revoke$/);
+  if (grantRevoke && req.method === "POST") {
+    const result = db.prepare("UPDATE enrollment_grants SET revoked_at=? WHERE id=? AND revoked_at IS NULL").run(new Date().toISOString(), grantRevoke[1]);
+    if (!result.changes) { send(res, 404, { error: "Grant not found or already revoked." }); return; }
+    audit("enrollment.grant_revoked", session.id, grantRevoke[1]);
+    send(res, 200, { ok: true }); return;
+  }
+  if (route === "/api/enrollment/pending" && req.method === "GET") {
+    const items = db.prepare(`SELECT d.id,d.name,d.operating_system AS operatingSystem,d.os_version AS osVersion,d.enrolled_at AS requestedAt,
+      p.name AS policyName,c.grant_id AS grantId FROM enrollment_claims c JOIN devices d ON d.id=c.device_id
+      JOIN enrollment_grants g ON g.id=c.grant_id JOIN enrollment_policies p ON p.id=g.policy_id WHERE c.state='pending' ORDER BY c.created_at`).all();
+    send(res, 200, { items }); return;
+  }
+  const reviewClaim = route.match(/^\/api\/enrollment\/pending\/([A-Fa-f0-9-]{16,64})\/(approve|reject)$/);
+  if (reviewClaim && req.method === "POST") {
+    const [, deviceId, action] = reviewClaim;
+    const claim = db.prepare("SELECT * FROM enrollment_claims WHERE device_id=? AND state='pending'").get(deviceId);
+    if (!claim) { send(res, 404, { error: "Pending enrollment request not found." }); return; }
+    if (action === "approve") {
+      db.prepare("UPDATE enrollment_claims SET state='approved',reviewed_by=?,reviewed_at=? WHERE device_id=?").run(session.id, new Date().toISOString(), deviceId);
+      db.prepare("UPDATE devices SET enrollment_state='approved' WHERE id=? AND revoked_at IS NULL").run(deviceId);
+      audit("enrollment.device_approved", session.id, deviceId, JSON.stringify({ grantId: claim.grant_id }));
+      send(res, 200, { ok: true, status: "approved" }); return;
+    }
+    db.prepare("UPDATE enrollment_claims SET state='rejected',reviewed_by=?,reviewed_at=? WHERE device_id=?").run(session.id, new Date().toISOString(), deviceId);
+    db.prepare("UPDATE devices SET enrollment_state='rejected',revoked_at=? WHERE id=?").run(new Date().toISOString(), deviceId);
+    audit("enrollment.device_rejected", session.id, deviceId, JSON.stringify({ grantId: claim.grant_id }));
+    send(res, 200, { ok: true, status: "rejected" }); return;
+  }
+  const revokeDevice = route.match(/^\/api\/devices\/([A-Fa-f0-9-]{16,64})\/revoke$/);
+  if (revokeDevice && req.method === "POST") {
+    const result = db.prepare("UPDATE devices SET revoked_at=? WHERE id=? AND revoked_at IS NULL").run(new Date().toISOString(), revokeDevice[1]);
+    if (!result.changes) { send(res, 404, { error: "Device not found or already revoked." }); return; }
+    audit("device.revoked", session.id, revokeDevice[1]);
+    send(res, 200, { ok: true }); return;
+  }
   if (route === "/api/overview" && req.method === "GET") {
-    const rows = db.prepare("SELECT last_seen, revoked_at FROM devices").all();
-    const live = rows.filter((r) => !r.revoked_at && isOnline(r.last_seen)).length;
+    const rows = db.prepare("SELECT last_seen, revoked_at, enrollment_state FROM devices").all();
+    const managed = rows.filter((r) => !r.revoked_at && r.enrollment_state === "approved");
+    const live = managed.filter((r) => isOnline(r.last_seen)).length;
     const revoked = rows.filter((r) => Boolean(r.revoked_at)).length;
     const series = db.prepare(`SELECT strftime('%Y-%m-%dT%H:00:00Z', recorded_at) AS hour,
       ROUND(AVG(cpu_percent),1) AS cpu, ROUND(AVG(memory_percent),1) AS memory
       FROM metric_samples WHERE recorded_at >= ? GROUP BY hour ORDER BY hour`).all(new Date(Date.now() - 24 * 60 * 60_000).toISOString());
-    const latest = db.prepare("SELECT MAX(last_seen) AS last_seen FROM devices WHERE revoked_at IS NULL").get().last_seen;
-    send(res, 200, { totalDevices: rows.length - revoked, onlineDevices: live, offlineDevices: rows.length - revoked - live,
-      revokedDevices: revoked, lastCheckIn: latest, performance: series });
+    const latest = db.prepare("SELECT MAX(last_seen) AS last_seen FROM devices WHERE revoked_at IS NULL AND enrollment_state='approved'").get().last_seen;
+    const pending = rows.filter((r) => !r.revoked_at && r.enrollment_state === "pending").length;
+    send(res, 200, { totalDevices: managed.length, onlineDevices: live, offlineDevices: managed.length - live,
+      revokedDevices: revoked, pendingEnrollments: pending, lastCheckIn: latest, performance: series });
     return;
   }
   if (route === "/api/devices" && req.method === "GET") {

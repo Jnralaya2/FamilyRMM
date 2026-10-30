@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import {
-  Activity, AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, ChevronDown,
+  Activity, AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, BadgePlus, ChevronDown,
   ChevronLeft, ChevronRight, CircleHelp, Clock3, Command, Computer,
   Download, LayoutDashboard, LoaderCircle, LogOut, MonitorCheck, RefreshCw,
   Search, Server, ShieldCheck, ShieldEllipsis, SlidersHorizontal, Wifi,
@@ -11,7 +11,7 @@ import {
 type AuthInfo = { setupRequired: boolean; authenticated: boolean; administrator: { id: string; email: string; role: string } | null; csrfToken: string | null };
 type Device = { id: string; name: string; operatingSystem: string | null; osVersion: string | null; architecture: string | null; manufacturer: string | null; model: string | null; cpu: string | null; cpuCores: number | null; totalMemoryMB: number | null; ipAddresses: string[]; agentVersion: string | null; lastSeen: string | null; enrolledAt: string; status: string; cpuUsagePercent?: number | null; memoryUsagePercent?: number | null };
 type Overview = { totalDevices: number; onlineDevices: number; offlineDevices: number; revokedDevices: number; lastCheckIn: string | null; performance: { hour: string; cpu: number | null; memory: number | null }[] };
-type Page = "overview" | "devices";
+type Page = "overview" | "devices" | "enrollment";
 type Health = { status: "ok" | "degraded"; database: "connected" | "unavailable"; checkedAt: string };
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -70,8 +70,9 @@ export default function App() {
       <div className="workspace-select"><div className="workspace-avatar">F</div><span><strong>Family Systems</strong><small>Single workspace</small></span></div>
       <div className="nav-label">MONITORING</div>
       <nav className="main-nav" aria-label="Main navigation">
-        <button className={`nav-item ${page === "overview" ? "selected" : ""}`} onClick={() => setPage("overview")}><LayoutDashboard size={17} /><span>Overview</span></button>
-        <button className={`nav-item ${page === "devices" ? "selected" : ""}`} onClick={() => setPage("devices")}><Computer size={17} /><span>Devices</span></button>
+        <button aria-label="Overview" className={`nav-item ${page === "overview" ? "selected" : ""}`} onClick={() => setPage("overview")}><LayoutDashboard size={17} /><span>Overview</span></button>
+        <button aria-label="Devices" className={`nav-item ${page === "devices" ? "selected" : ""}`} onClick={() => setPage("devices")}><Computer size={17} /><span>Devices</span></button>
+        <button aria-label="Enrollment" className={`nav-item ${page === "enrollment" ? "selected" : ""}`} onClick={() => setPage("enrollment")}><BadgePlus size={17} /><span>Enrollment</span></button>
       </nav>
       <div className="sidebar-bottom">
         <div className="connection-card"><div className={`connection-dot ${health}`} /><span><strong>{health === "ok" ? "Server connected" : health === "error" ? "Connection issue" : "Connecting"}</strong><small>{health === "ok" ? "Local environment" : "Checking service"}</small></span><Wifi size={15} /></div>
@@ -81,11 +82,11 @@ export default function App() {
 
     <main className="main-area">
       <header className="topbar">
-        <div className="breadcrumbs"><span>Family Systems</span><span className="crumb-sep">/</span><strong>{page === "overview" ? "Overview" : "Devices"}</strong></div>
+        <div className="breadcrumbs"><span>Family Systems</span><span className="crumb-sep">/</span><strong>{page === "overview" ? "Overview" : page === "devices" ? "Devices" : "Enrollment"}</strong></div>
         <div className="topbar-actions"><span className="environment-tag"><span />LOCAL ENVIRONMENT</span><button className="icon-button" title="Help" onClick={() => setHelpOpen(true)}><CircleHelp size={17} /></button><span className="top-avatar" aria-label="Current administrator">{auth.administrator?.email.slice(0, 1).toUpperCase()}</span></div>
       </header>
       <div className="page-content">
-        {page === "overview" ? <OverviewPage onOpenDevices={() => setPage("devices")} health={healthInfo} /> : <DevicesPage onNotice={showToast} />}
+        {page === "overview" ? <OverviewPage onOpenDevices={() => setPage("devices")} health={healthInfo} /> : page === "devices" ? <DevicesPage onNotice={showToast} /> : <EnrollmentPage csrfToken={auth.csrfToken || ""} onNotice={showToast} />}
       </div>
     </main>
     {toast && <div className="toast" role="status"><ShieldCheck size={16} />{toast}</div>}
@@ -177,6 +178,56 @@ function DeviceTable({ devices, onSelect, compact = false }: { devices: Device[]
   </tr>)}</tbody></table></div>;
 }
 function StatusPill({ status }: { status: string }) { const type = status.toLowerCase(); return <span className={`status-pill ${type}`}><i />{status}</span>; }
+
+type EnrollmentPolicy = { id: string; name: string; maxDevices: number; expiresInHours: number; approvalMode: "automatic" | "approval"; allowedOperatingSystems: string[]; createdAt: string; revokedAt: string | null; activeGrants: number };
+type EnrollmentGrant = { id: string; policyId: string; policyName: string; maxUses: number; usedCount: number; expiresAt: string; createdAt: string; revokedAt: string | null };
+function EnrollmentPage({ csrfToken, onNotice }: { csrfToken: string; onNotice: (message: string) => void }) {
+  const [policies, setPolicies] = useState<EnrollmentPolicy[]>([]); const [grants, setGrants] = useState<EnrollmentGrant[]>([]); const [pending, setPending] = useState<{ id: string; name: string; operatingSystem: string; policyName: string; requestedAt: string }[]>([]);
+  const [name, setName] = useState("Windows fleet"); const [limit, setLimit] = useState("25"); const [expiry, setExpiry] = useState("72"); const [approvalMode, setApprovalMode] = useState<"automatic" | "approval">("approval"); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
+  const headers = { "Content-Type": "application/json", "x-csrf-token": csrfToken };
+  const load = useCallback(async () => {
+    try { const [p, g, r] = await Promise.all([request<{ items: EnrollmentPolicy[] }>("/api/enrollment/policies"), request<{ items: EnrollmentGrant[] }>("/api/enrollment/grants"), request<{ items: typeof pending }>("/api/enrollment/pending")]); setPolicies(p.items); setGrants(g.items); setPending(r.items); setError(""); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not load enrollment settings."); }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+  const createPolicy = async (event: FormEvent) => {
+    event.preventDefault(); setBusy(true); setError("");
+    try { await request("/api/enrollment/policies", { method: "POST", headers, body: JSON.stringify({ name, maxDevices: Number(limit), expiresInHours: Number(expiry), approvalMode, allowedOperatingSystems: ["Windows"] }) }); await load(); onNotice("Enrollment policy created."); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not create enrollment policy."); }
+    finally { setBusy(false); }
+  };
+  const issueGrant = async (policy: EnrollmentPolicy) => {
+    setBusy(true); setError("");
+    try { await request(`/api/enrollment/policies/${policy.id}/grants`, { method: "POST", headers, body: "{}" }); await load(); onNotice(`Enrollment authorization issued for ${policy.name}.`); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not issue enrollment authorization."); }
+    finally { setBusy(false); }
+  };
+  const revoke = async (kind: "grants" | "policies", id: string) => {
+    setBusy(true); setError("");
+    try { await request(`/api/enrollment/${kind}/${id}/revoke`, { method: "POST", headers, body: "{}" }); await load(); onNotice(`${kind === "grants" ? "Enrollment authorization" : "Policy"} revoked.`); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not revoke enrollment access."); }
+    finally { setBusy(false); }
+  };
+  const review = async (id: string, action: "approve" | "reject") => {
+    setBusy(true); setError("");
+    try { await request(`/api/enrollment/pending/${encodeURIComponent(id)}/${action}`, { method: "POST", headers, body: "{}" }); await load(); onNotice(`Enrollment request ${action === "approve" ? "approved" : "rejected"}.`); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not review enrollment request."); }
+    finally { setBusy(false); }
+  };
+  return <>
+    <div className="page-heading"><div><div className="eyebrow">ACCESS CONTROL</div><h1>Enrollment</h1><p>Set the rules for devices that may register with this RMM.</p></div></div>
+    <div className="enrollment-callout"><span className="enrollment-callout-icon"><ShieldCheck size={18} /></span><div><strong>Windows MSI distribution is not ready yet</strong><p>Policy authorization is active. Downloadable installers will appear after the agent and signed MSI pipeline are built and verified.</p></div><span className="integration-badge">PACKAGING IN PROGRESS</span></div>
+    {error && <div className="table-error"><AlertCircle size={16} /><span>{error}</span><button onClick={() => void load()}>Retry</button></div>}
+    <div className="enrollment-grid">
+      <section className="panel enrollment-create"><div className="panel-heading"><div><h2>Enrollment policies</h2><p>Control authorization lifetime and review requirements.</p></div></div>
+        <form className="enrollment-form" onSubmit={createPolicy}><label>Policy name<input value={name} onChange={(e) => setName(e.target.value)} maxLength={100} required /></label><div className="form-row"><label>Device limit<input type="number" min="1" max="10000" value={limit} onChange={(e) => setLimit(e.target.value)} required /></label><label>Authorization expiry (hours)<input type="number" min="1" max="8760" value={expiry} onChange={(e) => setExpiry(e.target.value)} required /></label></div><label>New device approval<select value={approvalMode} onChange={(e) => setApprovalMode(e.target.value as "automatic" | "approval")}><option value="approval">Require administrator review</option><option value="automatic">Approve automatically</option></select></label><div className="form-foot"><span><ShieldCheck size={14} />Signed authorizations are limited and revocable.</span><button className="primary-button" disabled={busy}><BadgePlus size={15} />Create policy</button></div></form>
+      </section>
+      <section className="panel enrollment-pending"><div className="panel-heading"><div><h2>Pending approval</h2><p>New computers awaiting an administrator decision.</p></div><span className="pending-count">{pending.length}</span></div>{pending.length ? <div className="pending-list">{pending.map((item) => <div className="pending-item" key={item.id}><div><strong>{item.name}</strong><small>{item.operatingSystem} · {item.policyName}</small></div><span className="pending-actions"><button className="secondary-button" disabled={busy} onClick={() => void review(item.id, "reject")}>Reject</button><button className="primary-button" disabled={busy} onClick={() => void review(item.id, "approve")}>Approve</button></span></div>)}</div> : <div className="compact-empty"><span><ShieldCheck size={17} /></span><strong>No requests to review</strong><small>New installs appear here when policy review is required.</small></div>}</section>
+    </div>
+    <section className="panel enrollment-policy-list"><div className="panel-heading"><div><h2>Active policies</h2><p>Each issued authorization is signed by this server and limited by device count and expiry.</p></div></div>{policies.length ? <div className="table-scroll"><table className="device-table enrollment-table"><thead><tr><th>POLICY</th><th>DEVICE LIMIT</th><th>APPROVAL</th><th>ACTIVE GRANTS</th><th>CREATED</th><th /></tr></thead><tbody>{policies.map((policy) => <tr key={policy.id}><td><strong>{policy.name}</strong><small className="table-subline">Windows · expires in {policy.expiresInHours}h</small></td><td>{policy.maxDevices.toLocaleString()}</td><td>{policy.approvalMode === "approval" ? "Administrator review" : "Automatic"}</td><td>{policy.activeGrants}</td><td>{shortDate(policy.createdAt)}</td><td>{policy.revokedAt ? <StatusPill status="Revoked" /> : <button className="secondary-button" disabled={busy} onClick={() => void issueGrant(policy)}>Issue authorization</button>}</td></tr>)}</tbody></table></div> : <div className="compact-empty"><strong>No policies yet</strong><small>Create a policy to define enrollment rules.</small></div>}</section>
+    <section className="panel enrollment-policy-list"><div className="panel-heading"><div><h2>Enrollment authorizations</h2><p>Track per-policy package grants and revoke compromised authorizations.</p></div></div>{grants.length ? <div className="table-scroll"><table className="device-table enrollment-table"><thead><tr><th>POLICY</th><th>DEVICES USED</th><th>EXPIRES</th><th>CREATED</th><th>STATUS</th><th /></tr></thead><tbody>{grants.map((grant) => <tr key={grant.id}><td><strong>{grant.policyName}</strong><small className="table-subline">{grant.id.slice(0, 12)}…</small></td><td>{grant.usedCount} / {grant.maxUses}</td><td>{shortDate(grant.expiresAt)}</td><td>{shortDate(grant.createdAt)}</td><td><StatusPill status={grant.revokedAt ? "Revoked" : Date.parse(grant.expiresAt) <= Date.now() ? "Expired" : "Active"} /></td><td>{!grant.revokedAt && Date.parse(grant.expiresAt) > Date.now() && <button className="secondary-button" disabled={busy} onClick={() => void revoke("grants", grant.id)}>Revoke</button>}</td></tr>)}</tbody></table></div> : <div className="compact-empty"><strong>No authorizations issued</strong><small>Issue one from an active policy.</small></div>}</section>
+  </>;
+}
 
 function DevicesPage({ onNotice }: { onNotice: (s: string) => void }) {
   const [items, setItems] = useState<Device[]>([]); const [q, setQ] = useState(""); const [status, setStatus] = useState("all"); const [sort, setSort] = useState("name"); const [direction, setDirection] = useState("asc");
