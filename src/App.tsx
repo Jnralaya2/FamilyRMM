@@ -4,14 +4,14 @@ import {
   Activity, AlertCircle, ArrowDown, ArrowUp, ArrowUpDown, BadgePlus, ChevronDown,
   ChevronLeft, ChevronRight, CircleHelp, Clock3, Command, Computer,
   Download, LayoutDashboard, LoaderCircle, LogOut, MonitorCheck, RefreshCw,
-  Search, Server, ShieldCheck, ShieldEllipsis, SlidersHorizontal, Wifi,
+  Search, Server, ShieldCheck, ShieldEllipsis, SlidersHorizontal, ScrollText, Wifi,
   X,
 } from "lucide-react";
 
 type AuthInfo = { setupRequired: boolean; authenticated: boolean; administrator: { id: string; email: string; role: string } | null; csrfToken: string | null };
 type Device = { id: string; name: string; operatingSystem: string | null; osVersion: string | null; architecture: string | null; manufacturer: string | null; model: string | null; cpu: string | null; cpuCores: number | null; totalMemoryMB: number | null; ipAddresses: string[]; agentVersion: string | null; lastSeen: string | null; enrolledAt: string; status: string; cpuUsagePercent?: number | null; memoryUsagePercent?: number | null };
 type Overview = { totalDevices: number; onlineDevices: number; offlineDevices: number; revokedDevices: number; lastCheckIn: string | null; performance: { hour: string; cpu: number | null; memory: number | null }[] };
-type Page = "overview" | "devices" | "enrollment";
+type Page = "overview" | "devices" | "enrollment" | "audit";
 type Health = { status: "ok" | "degraded"; database: "connected" | "unavailable"; checkedAt: string };
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -73,6 +73,7 @@ export default function App() {
         <button aria-label="Overview" className={`nav-item ${page === "overview" ? "selected" : ""}`} onClick={() => setPage("overview")}><LayoutDashboard size={17} /><span>Overview</span></button>
         <button aria-label="Devices" className={`nav-item ${page === "devices" ? "selected" : ""}`} onClick={() => setPage("devices")}><Computer size={17} /><span>Devices</span></button>
         <button aria-label="Enrollment" className={`nav-item ${page === "enrollment" ? "selected" : ""}`} onClick={() => setPage("enrollment")}><BadgePlus size={17} /><span>Enrollment</span></button>
+        <button aria-label="Audit log" className={`nav-item ${page === "audit" ? "selected" : ""}`} onClick={() => setPage("audit")}><ScrollText size={17} /><span>Audit log</span></button>
       </nav>
       <div className="sidebar-bottom">
         <div className="connection-card"><div className={`connection-dot ${health}`} /><span><strong>{health === "ok" ? "Server connected" : health === "error" ? "Connection issue" : "Connecting"}</strong><small>{health === "ok" ? "Local environment" : "Checking service"}</small></span><Wifi size={15} /></div>
@@ -82,11 +83,11 @@ export default function App() {
 
     <main className="main-area">
       <header className="topbar">
-        <div className="breadcrumbs"><span>Family Systems</span><span className="crumb-sep">/</span><strong>{page === "overview" ? "Overview" : page === "devices" ? "Devices" : "Enrollment"}</strong></div>
+        <div className="breadcrumbs"><span>Family Systems</span><span className="crumb-sep">/</span><strong>{page === "overview" ? "Overview" : page === "devices" ? "Devices" : page === "enrollment" ? "Enrollment" : "Audit log"}</strong></div>
         <div className="topbar-actions"><span className="environment-tag"><span />LOCAL ENVIRONMENT</span><button className="icon-button" title="Help" onClick={() => setHelpOpen(true)}><CircleHelp size={17} /></button><span className="top-avatar" aria-label="Current administrator">{auth.administrator?.email.slice(0, 1).toUpperCase()}</span></div>
       </header>
       <div className="page-content">
-        {page === "overview" ? <OverviewPage onOpenDevices={() => setPage("devices")} health={healthInfo} /> : page === "devices" ? <DevicesPage onNotice={showToast} /> : <EnrollmentPage csrfToken={auth.csrfToken || ""} onNotice={showToast} />}
+        {page === "overview" ? <OverviewPage onOpenDevices={() => setPage("devices")} health={healthInfo} /> : page === "devices" ? <DevicesPage onNotice={showToast} /> : page === "enrollment" ? <EnrollmentPage csrfToken={auth.csrfToken || ""} onNotice={showToast} /> : <AuditPage />}
       </div>
     </main>
     {toast && <div className="toast" role="status"><ShieldCheck size={16} />{toast}</div>}
@@ -226,6 +227,24 @@ function EnrollmentPage({ csrfToken, onNotice }: { csrfToken: string; onNotice: 
     </div>
     <section className="panel enrollment-policy-list"><div className="panel-heading"><div><h2>Active policies</h2><p>Each issued authorization is signed by this server and limited by device count and expiry.</p></div></div>{policies.length ? <div className="table-scroll"><table className="device-table enrollment-table"><thead><tr><th>POLICY</th><th>DEVICE LIMIT</th><th>APPROVAL</th><th>ACTIVE GRANTS</th><th>CREATED</th><th /></tr></thead><tbody>{policies.map((policy) => <tr key={policy.id}><td><strong>{policy.name}</strong><small className="table-subline">Windows · expires in {policy.expiresInHours}h</small></td><td>{policy.maxDevices.toLocaleString()}</td><td>{policy.approvalMode === "approval" ? "Administrator review" : "Automatic"}</td><td>{policy.activeGrants}</td><td>{shortDate(policy.createdAt)}</td><td>{policy.revokedAt ? <StatusPill status="Revoked" /> : <button className="secondary-button" disabled={busy} onClick={() => void issueGrant(policy)}>Issue authorization</button>}</td></tr>)}</tbody></table></div> : <div className="compact-empty"><strong>No policies yet</strong><small>Create a policy to define enrollment rules.</small></div>}</section>
     <section className="panel enrollment-policy-list"><div className="panel-heading"><div><h2>Enrollment authorizations</h2><p>Track per-policy package grants and revoke compromised authorizations.</p></div></div>{grants.length ? <div className="table-scroll"><table className="device-table enrollment-table"><thead><tr><th>POLICY</th><th>DEVICES USED</th><th>EXPIRES</th><th>CREATED</th><th>STATUS</th><th /></tr></thead><tbody>{grants.map((grant) => <tr key={grant.id}><td><strong>{grant.policyName}</strong><small className="table-subline">{grant.id.slice(0, 12)}…</small></td><td>{grant.usedCount} / {grant.maxUses}</td><td>{shortDate(grant.expiresAt)}</td><td>{shortDate(grant.createdAt)}</td><td><StatusPill status={grant.revokedAt ? "Revoked" : Date.parse(grant.expiresAt) <= Date.now() ? "Expired" : "Active"} /></td><td>{!grant.revokedAt && Date.parse(grant.expiresAt) > Date.now() && <button className="secondary-button" disabled={busy} onClick={() => void revoke("grants", grant.id)}>Revoke</button>}</td></tr>)}</tbody></table></div> : <div className="compact-empty"><strong>No authorizations issued</strong><small>Issue one from an active policy.</small></div>}</section>
+  </>;
+}
+
+type AuditEvent = { id: number; action: string; targetId: string | null; detail: string | null; createdAt: string; actor: string | null };
+function AuditPage() {
+  const [events, setEvents] = useState<AuditEvent[]>([]); const [query, setQuery] = useState(""); const [loading, setLoading] = useState(true); const [error, setError] = useState(""); const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
+  const load = useCallback(async () => { setLoading(true); try { const response = await request<{ items: AuditEvent[] }>("/api/audit"); setEvents(response.items); setUpdatedAt(new Date()); setError(""); } catch (e) { setError(e instanceof Error ? e.message : "Could not load audit events."); } finally { setLoading(false); } }, []);
+  useEffect(() => { void load(); }, [load]);
+  const filtered = events.filter((event) => [event.action, event.actor, event.targetId, event.detail].some((value) => String(value || "").toLowerCase().includes(query.trim().toLowerCase())));
+  const label = (action: string) => action.split(".").map((word) => word.replaceAll("_", " ")).join(" · ");
+  return <>
+    <div className="page-heading"><div><div className="eyebrow">GOVERNANCE</div><h1>Audit log</h1><p>Recent administrator and device enrollment activity.</p></div><div className="heading-actions"><span className="updated-note">{updatedAt ? `Updated ${timeAgo(updatedAt.toISOString()).toLowerCase()}` : ""}</span><button className="secondary-button" onClick={() => void load()} disabled={loading}><RefreshCw size={15} className={loading ? "spin" : ""} />Refresh</button></div></div>
+    <div className="inventory-summary"><div><span className="summary-icon"><ScrollText size={17} /></span><span><strong>{events.length.toLocaleString()}</strong><small>Recent events retained in this view</small></span></div><span className="inventory-summary-note">Newest activity first · up to 50 events</span></div>
+    <section className="panel inventory-panel"><div className="inventory-toolbar"><div className="filter-search"><Search size={16} /><input aria-label="Search audit events" placeholder="Search action, administrator or target" value={query} onChange={(e) => setQuery(e.target.value)} />{query && <button className="clear-search" onClick={() => setQuery("")} aria-label="Clear search"><X size={14} /></button>}</div></div>
+      {error && <div className="table-error"><AlertCircle size={16} /><span>{error}</span><button onClick={() => void load()}>Retry</button></div>}
+      {loading ? <TableSkeleton /> : filtered.length ? <div className="table-scroll"><table className="device-table audit-table"><thead><tr><th>EVENT</th><th>ADMINISTRATOR</th><th>TARGET</th><th>TIME</th><th>DETAIL</th></tr></thead><tbody>{filtered.map((event) => <tr key={event.id}><td><span className="audit-action"><i />{label(event.action)}</span></td><td>{event.actor || "System"}</td><td className="audit-target">{event.targetId || "—"}</td><td><span className="checkin-cell">{timeAgo(event.createdAt)}<small>{shortDate(event.createdAt)}</small></span></td><td>{event.detail ? <details className="audit-detail"><summary>View</summary><pre>{(() => { try { return JSON.stringify(JSON.parse(event.detail!), null, 2); } catch { return event.detail; } })()}</pre></details> : "—"}</td></tr>)}</tbody></table></div> : <div className="inventory-empty"><div className="empty-device-mark"><ScrollText size={21} /></div><strong>{query ? "No matching events" : "No audit activity yet"}</strong><p>{query ? "Try a different search term." : "Administrator changes and enrollment events will be recorded here."}</p>{query && <button className="secondary-button" onClick={() => setQuery("")}>Clear search</button>}</div>}
+      {!loading && filtered.length > 0 && <div className="table-footer"><span>Showing {filtered.length} of {events.length.toLocaleString()} recent events</span></div>}
+    </section>
   </>;
 }
 
