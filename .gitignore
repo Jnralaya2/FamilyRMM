@@ -2,6 +2,11 @@ node_modules/
 dist/
 data/
 .logs/
+.dotnet-cli/
+.nuget/
+.artifacts/
+agent/**/bin/
+agent/**/obj/
 .env
 .env.*
 !.env.example

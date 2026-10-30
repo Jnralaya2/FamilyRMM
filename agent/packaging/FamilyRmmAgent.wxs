@@ -1,0 +1,48 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Family RMM Agent"
+           Manufacturer="Family Systems"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="5F0BFE5A-A25F-4F70-B9C7-EE9D6B64F8E1"
+           Scope="perMachine"
+           InstallerVersion="500">
+    <SummaryInformation Description="Family RMM Windows endpoint agent" Manufacturer="Family Systems" />
+    <MajorUpgrade DowngradeErrorMessage="A newer Family RMM Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="AgentFeature" Title="Family RMM Agent" Level="1">
+      <ComponentRef Id="AgentServiceComponent" />
+      <ComponentRef Id="AgentStateComponent" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Family RMM Agent" />
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="RmmProgramData" Name="FamilyRMM" />
+    </StandardDirectory>
+
+    <Component Id="AgentServiceComponent" Directory="INSTALLFOLDER" Guid="*">
+      <File Id="AgentExecutable" Source="$(var.AgentExe)" KeyPath="yes" />
+      <File Id="AgentConfiguration" Source="$(var.AgentConfig)" Name="rmm-agent.json" />
+      <ServiceInstall Id="AgentServiceInstall"
+                      Name="FamilyRmmAgent"
+                      DisplayName="Family RMM Agent"
+                      Description="Securely reports computer inventory to the configured Family RMM server."
+                      Type="ownProcess"
+                      Start="auto"
+                      ErrorControl="normal"
+                      Account="LocalSystem"
+                      Vital="yes" />
+      <ServiceControl Id="AgentServiceControl" Name="FamilyRmmAgent" Stop="both" Remove="uninstall" Wait="yes" />
+    </Component>
+
+    <Component Id="AgentStateComponent" Directory="RmmProgramData" Guid="*" Condition="NOT UPGRADINGPRODUCTCODE">
+      <CreateFolder />
+      <RemoveFile Id="RemoveDeviceIdentity" Name="device-identity.json" On="uninstall" />
+      <RemoveFile Id="RemoveAgentStatus" Name="status.json" On="uninstall" />
+      <RemoveFile Id="RemoveIdentityTemp" Name="device-identity.json.tmp" On="uninstall" />
+      <RemoveFolder Id="RemoveRmmProgramData" On="uninstall" />
+      <RegistryValue Root="HKLM" Key="Software\Family Systems\Family RMM Agent" Name="StateDirectory" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>

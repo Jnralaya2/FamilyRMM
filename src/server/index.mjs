@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { createHash, createPublicKey, generateKeyPairSync, randomBytes, scrypt as scryptCallback, sign as cryptoSign, timingSafeEqual, verify as cryptoVerify } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -47,6 +48,7 @@ db.exec(`
     ip_addresses TEXT,
     agent_version TEXT,
     last_seen TEXT,
+    software_inventory_at TEXT,
     enrolled_at TEXT NOT NULL,
     revoked_at TEXT
   );
@@ -99,6 +101,22 @@ db.exec(`
     created_at TEXT NOT NULL,
     revoked_at TEXT
   );
+  CREATE TABLE IF NOT EXISTS installer_packages (
+    id TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL REFERENCES enrollment_grants(id),
+    agent_version TEXT NOT NULL,
+    build_status TEXT NOT NULL,
+    signing_status TEXT,
+    msi_file TEXT,
+    setup_file TEXT,
+    msi_sha256 TEXT,
+    setup_sha256 TEXT,
+    build_error TEXT,
+    created_by TEXT NOT NULL REFERENCES administrators(id),
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS installer_packages_created_idx ON installer_packages(created_at);
   CREATE TABLE IF NOT EXISTS enrollment_claims (
     device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
     grant_id TEXT NOT NULL REFERENCES enrollment_grants(id),
@@ -122,6 +140,7 @@ const deviceColumns = new Set(db.prepare("PRAGMA table_info(devices)").all().map
 if (!deviceColumns.has("device_public_key")) db.exec("ALTER TABLE devices ADD COLUMN device_public_key TEXT");
 if (!deviceColumns.has("enrollment_grant_id")) db.exec("ALTER TABLE devices ADD COLUMN enrollment_grant_id TEXT");
 if (!deviceColumns.has("enrollment_state")) db.exec("ALTER TABLE devices ADD COLUMN enrollment_state TEXT NOT NULL DEFAULT 'approved'");
+if (!deviceColumns.has("software_inventory_at")) db.exec("ALTER TABLE devices ADD COLUMN software_inventory_at TEXT");
 
 const serverUrl = (process.env.RMM_SERVER_URL || "http://127.0.0.1:3001").replace(/\/$/, "");
 if (process.env.RMM_ENV === "production") {
@@ -145,10 +164,19 @@ if (process.env.RMM_ENROLLMENT_PRIVATE_KEY) {
   try {
     enrollmentPrivateKey = await readFile(signingPath, "utf8");
   } catch {
-    const pair = generateKeyPairSync("ed25519", { privateKeyEncoding: { format: "pem", type: "pkcs8" }, publicKeyEncoding: { format: "pem", type: "spki" } });
+    const pair = generateKeyPairSync("ec", { namedCurve: "prime256v1", privateKeyEncoding: { format: "pem", type: "pkcs8" }, publicKeyEncoding: { format: "pem", type: "spki" } });
     enrollmentPrivateKey = pair.privateKey;
     try { await writeFile(signingPath, enrollmentPrivateKey, { flag: "wx", mode: 0o600 }); }
     catch { enrollmentPrivateKey = await readFile(signingPath, "utf8"); }
+  }
+  if (createPublicKey(enrollmentPrivateKey).asymmetricKeyType !== "ec") {
+    if (db.prepare("SELECT COUNT(*) AS n FROM enrollment_grants").get().n > 0) {
+      console.error("The development enrollment key uses a previous algorithm and active grants exist; migrate or revoke them before rotating the key.");
+      process.exit(1);
+    }
+    const pair = generateKeyPairSync("ec", { namedCurve: "prime256v1", privateKeyEncoding: { format: "pem", type: "pkcs8" }, publicKeyEncoding: { format: "pem", type: "spki" } });
+    enrollmentPrivateKey = pair.privateKey;
+    await writeFile(signingPath, enrollmentPrivateKey, { mode: 0o600 });
   }
   enrollmentPublicKey = createPublicKey(enrollmentPrivateKey).export({ format: "pem", type: "spki" }).toString();
 }
@@ -157,7 +185,11 @@ const canonicalJson = (value) => {
   if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
   return JSON.stringify(value);
 };
-const signManifest = (manifest) => cryptoSign(null, Buffer.from(canonicalJson(manifest)), enrollmentPrivateKey).toString("base64url");
+if (createPublicKey(enrollmentPrivateKey).asymmetricKeyType !== "ec") {
+  console.error("RMM_ENROLLMENT_PRIVATE_KEY must contain a P-256 ECDSA key.");
+  process.exit(1);
+}
+const signManifest = (manifest) => cryptoSign("sha256", Buffer.from(canonicalJson(manifest)), enrollmentPrivateKey).toString("base64url");
 
 const counts = db.prepare("SELECT COUNT(*) AS n FROM administrators").get();
 let setupToken = null;
@@ -259,7 +291,7 @@ function authenticateAgentRequest(req, raw, res) {
   if (!device || device.revoked_at || device.enrollment_state !== "approved" || !device.device_public_key) { send(res, 403, { error: "This device is not authorized." }); return null; }
   const message = Buffer.concat([Buffer.from(`${timestamp}\n${nonce}\n`), raw]);
   let valid = false;
-  try { valid = cryptoVerify(null, message, device.device_public_key, Buffer.from(signature, "base64url")); } catch { valid = false; }
+  try { valid = cryptoVerify("sha256", message, device.device_public_key, Buffer.from(signature, "base64url")); } catch { valid = false; }
   if (!valid) { send(res, 401, { error: "Agent signature is invalid." }); return null; }
   try { db.prepare("INSERT INTO agent_request_nonces(device_id, nonce, used_at) VALUES(?,?,?)").run(deviceId, nonce, Date.now()); }
   catch { send(res, 409, { error: "Agent request nonce has already been used." }); return null; }
@@ -294,6 +326,7 @@ function deviceView(row) {
     totalMemoryMB: row.total_memory_mb,
     ipAddresses: ips,
     agentVersion: row.agent_version,
+    softwareInventoryAt: row.software_inventory_at ?? null,
     cpuUsagePercent: row.cpu_percent ?? null,
     memoryUsagePercent: row.memory_percent ?? null,
     lastSeen: row.last_seen,
@@ -385,7 +418,7 @@ async function api(req, res, url) {
   }
 
   if (route === "/api/enrollment/public-key" && req.method === "GET") {
-    send(res, 200, { algorithm: "Ed25519", publicKey: enrollmentPublicKey, serverUrl });
+    send(res, 200, { algorithm: "ECDSA-P256-SHA256", publicKey: enrollmentPublicKey, serverUrl });
     return;
   }
   if (route === "/api/agent/enroll" && req.method === "POST") {
@@ -396,7 +429,7 @@ async function api(req, res, url) {
     const signature = typeof grant?.signature === "string" ? grant.signature : "";
     if (!manifest || typeof manifest !== "object" || signature.length > 256) { send(res, 400, { error: "A signed enrollment grant is required." }); return; }
     let signatureValid = false;
-    try { signatureValid = cryptoVerify(null, Buffer.from(canonicalJson(manifest)), enrollmentPublicKey, Buffer.from(signature, "base64url")); } catch { signatureValid = false; }
+    try { signatureValid = cryptoVerify("sha256", Buffer.from(canonicalJson(manifest)), enrollmentPublicKey, Buffer.from(signature, "base64url")); } catch { signatureValid = false; }
     if (!signatureValid) { send(res, 403, { error: "Enrollment grant signature is invalid." }); return; }
     if (manifest.version !== 1 || manifest.serverUrl !== serverUrl || manifest.audience !== serverUrl || typeof manifest.grantId !== "string" || typeof manifest.policyId !== "string") {
       send(res, 403, { error: "Enrollment grant is for a different server or policy." }); return;
@@ -415,20 +448,20 @@ async function api(req, res, url) {
     const proof = typeof body.proofSignature === "string" ? body.proofSignature : "";
     let publicKey;
     try { publicKey = createPublicKey(publicKeyPem); } catch { publicKey = null; }
-    if (!/^[A-Fa-f0-9-]{16,64}$/.test(deviceId) || !name || name.length > 200 || !os || os.length > 120 || !publicKey || publicKey.asymmetricKeyType !== "ed25519" || publicKeyPem.length > 4096 || !/^[A-Za-z0-9_-]{20,120}$/.test(clientNonce) || !Number.isSafeInteger(clientTimestamp) || Math.abs(Date.now() - clientTimestamp) > 5 * 60_000) {
+    if (!/^[A-Fa-f0-9-]{16,64}$/.test(deviceId) || !name || name.length > 200 || !os || os.length > 120 || !publicKey || publicKey.asymmetricKeyType !== "ec" || publicKey.asymmetricKeyDetails?.namedCurve !== "prime256v1" || publicKeyPem.length > 4096 || !/^[A-Za-z0-9_-]{20,120}$/.test(clientNonce) || !Number.isSafeInteger(clientTimestamp) || Math.abs(Date.now() - clientTimestamp) > 5 * 60_000) {
       send(res, 400, { error: "Device identity or installation details are invalid." }); return;
     }
     const allowedOS = JSON.parse(policy.allowed_os_json);
     if (allowedOS.length && !allowedOS.some((allowed) => os.toLowerCase().includes(allowed.toLowerCase()))) { send(res, 403, { error: "This operating system is not allowed by the enrollment policy." }); return; }
     const proofMessage = Buffer.from(`${manifest.grantId}\n${deviceId}\n${clientTimestamp}\n${clientNonce}`);
     let proofValid = false;
-    try { proofValid = cryptoVerify(null, proofMessage, publicKey, Buffer.from(proof, "base64url")); } catch { proofValid = false; }
+    try { proofValid = cryptoVerify("sha256", proofMessage, publicKey, Buffer.from(proof, "base64url")); } catch { proofValid = false; }
     if (!proofValid) { send(res, 401, { error: "Device key proof is invalid." }); return; }
 
     const existing = db.prepare("SELECT * FROM devices WHERE id=?").get(deviceId);
     if (existing) {
       if (existing.enrollment_grant_id === grantRow.id && existing.device_public_key === publicKeyPem && !existing.revoked_at) {
-        send(res, existing.enrollment_state === "pending" ? 202 : 200, { deviceId, status: existing.enrollment_state, idempotent: true }); return;
+        send(res, existing.enrollment_state === "pending" ? 202 : 200, { deviceId, status: existing.enrollment_state, checkInAllowed: existing.enrollment_state === "approved", idempotent: true }); return;
       }
       send(res, 409, { error: "This device identity has already been used." }); return;
     }
@@ -498,7 +531,8 @@ async function api(req, res, url) {
       db.prepare("DELETE FROM software_inventory WHERE device_id=?").run(device.id);
       for (const app of apps) insertSoftware.run(device.id, app.name, typeof app.version === "string" ? app.version.slice(0,120) : null,
         typeof app.publisher === "string" ? app.publisher.slice(0,200) : null, typeof app.installedAt === "string" && !Number.isNaN(Date.parse(app.installedAt)) ? app.installedAt : null);
-      db.prepare("UPDATE devices SET last_seen=? WHERE id=?").run(new Date().toISOString(), device.id);
+      const inventoryAt = new Date().toISOString();
+      db.prepare("UPDATE devices SET last_seen=?,software_inventory_at=? WHERE id=?").run(inventoryAt, inventoryAt, device.id);
       db.exec("COMMIT");
     } catch {
       try { db.exec("ROLLBACK"); } catch { /* The transaction may already be closed. */ }
@@ -638,6 +672,91 @@ async function api(req, res, url) {
     const result = db.prepare("UPDATE devices SET revoked_at=? WHERE id=? AND revoked_at IS NULL").run(new Date().toISOString(), revokeDevice[1]);
     if (!result.changes) { send(res, 404, { error: "Device not found or already revoked." }); return; }
     audit("device.revoked", session.id, revokeDevice[1]);
+    send(res, 200, { ok: true }); return;
+  }
+  if (route === "/api/installer-packages" && req.method === "GET") {
+    const now = new Date().toISOString();
+    const items = db.prepare(`SELECT i.id,i.grant_id AS grantId,i.agent_version AS agentVersion,i.build_status AS buildStatus,
+      i.signing_status AS signingStatus,i.msi_sha256 AS msiSha256,i.setup_sha256 AS setupSha256,i.build_error AS buildError,i.created_at AS createdAt,i.revoked_at AS revokedAt,
+      g.max_uses AS maxUses,g.used_count AS usedCount,g.expires_at AS expiresAt,g.revoked_at AS grantRevokedAt,p.name AS policyName
+      FROM installer_packages i JOIN enrollment_grants g ON g.id=i.grant_id JOIN enrollment_policies p ON p.id=g.policy_id
+      ORDER BY i.created_at DESC LIMIT 100`).all();
+    send(res, 200, { items: items.map((item) => ({ ...item, status: item.revokedAt || item.grantRevokedAt ? "revoked" : item.expiresAt <= now ? "expired" : item.usedCount >= item.maxUses ? "limit reached" : item.buildStatus })) });
+    return;
+  }
+  if (route === "/api/installer-packages" && req.method === "POST") {
+    let body;
+    try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid installer request." }); return; }
+    const grantId = typeof body.grantId === "string" ? body.grantId : "";
+    if (!/^[a-f0-9]{32}$/.test(grantId)) { send(res, 400, { error: "A valid enrollment authorization is required." }); return; }
+    const grant = db.prepare(`SELECT g.*,p.name AS policy_name,p.revoked_at AS policy_revoked_at
+      FROM enrollment_grants g JOIN enrollment_policies p ON p.id=g.policy_id WHERE g.id=?`).get(grantId);
+    if (!grant || grant.revoked_at || grant.policy_revoked_at || Date.parse(grant.expires_at) <= Date.now() || grant.used_count >= grant.max_uses) {
+      send(res, 409, { error: "This enrollment authorization is expired, revoked, or has no remaining device slots." }); return;
+    }
+    const id = randomBytes(16).toString("hex");
+    const agentVersion = process.env.RMM_AGENT_VERSION || "0.1.0";
+    const createdAt = new Date().toISOString();
+    const outputDir = path.join(root, ".artifacts", "packages", id);
+    const configPath = path.join(outputDir, "package-config.json");
+    await mkdir(outputDir, { recursive: true });
+    const manifest = JSON.parse(grant.manifest_json);
+    const enrollmentGrant = { manifest, signature: grant.signature };
+    await writeFile(configPath, JSON.stringify({ serverUrl, agentVersion, enrollmentGrant }, null, 2), { flag: "wx" });
+    db.prepare(`INSERT INTO installer_packages(id,grant_id,agent_version,build_status,created_by,created_at) VALUES(?,?,?,'building',?,?)`)
+      .run(id, grantId, agentVersion, session.id, createdAt);
+    try {
+      execFileSync(process.execPath, [path.join(root, "scripts", "build-agent-package.mjs")], {
+        cwd: root,
+        env: { ...process.env, RMM_PACKAGE_CONFIG_PATH: configPath, RMM_PACKAGE_DIR: outputDir, RMM_PACKAGE_VERSION: agentVersion },
+        encoding: "utf8", windowsHide: true, timeout: 10 * 60_000, maxBuffer: 4 * 1024 * 1024,
+      });
+      const buildInfo = JSON.parse(await readFile(path.join(outputDir, "build-info.json"), "utf8"));
+      db.prepare(`UPDATE installer_packages SET build_status='ready',signing_status=?,msi_file=?,setup_file=?,msi_sha256=?,setup_sha256=? WHERE id=?`)
+        .run(buildInfo.signingStatus, buildInfo.installer.file, buildInfo.setup.file, buildInfo.installer.sha256, buildInfo.setup.sha256, id);
+      audit("installer.package_created", session.id, id, JSON.stringify({ grantId, agentVersion, signingStatus: buildInfo.signingStatus }));
+      send(res, 201, { id, grantId, agentVersion, status: "ready", signingStatus: buildInfo.signingStatus, createdAt,
+        msiSha256: buildInfo.installer.sha256, setupSha256: buildInfo.setup.sha256,
+        downloads: { msi: `/api/installer-packages/${id}/msi`, exe: `/api/installer-packages/${id}/exe` } });
+    } catch (error) {
+      const message = String(error?.message || "Installer build failed.").slice(0, 1500);
+      db.prepare("UPDATE installer_packages SET build_status='failed',build_error=? WHERE id=?").run(message, id);
+      audit("installer.package_build_failed", session.id, id, JSON.stringify({ grantId, reason: message.slice(0, 400) }));
+      send(res, 500, { error: "Windows installer build failed. Review the package status and server build log." });
+    }
+    return;
+  }
+  const packageDownload = route.match(/^\/api\/installer-packages\/([a-f0-9]{32})\/(msi|exe)$/);
+  if (packageDownload && req.method === "GET") {
+    const item = db.prepare(`SELECT i.*,g.expires_at,g.used_count,g.max_uses,g.revoked_at AS grant_revoked,p.revoked_at AS policy_revoked
+      FROM installer_packages i JOIN enrollment_grants g ON g.id=i.grant_id JOIN enrollment_policies p ON p.id=g.policy_id WHERE i.id=?`).get(packageDownload[1]);
+    if (!item || item.build_status !== "ready") { send(res, 404, { error: "Installer package is not available." }); return; }
+    if (item.revoked_at || item.grant_revoked || item.policy_revoked || Date.parse(item.expires_at) <= Date.now() || item.used_count >= item.max_uses) {
+      send(res, 410, { error: "This installer authorization is expired, revoked, or fully used." }); return;
+    }
+    const fileName = packageDownload[2] === "msi" ? item.msi_file : item.setup_file;
+    const expectedPrefix = path.resolve(root, ".artifacts", "packages", item.id) + path.sep;
+    const filePath = path.resolve(root, ".artifacts", "packages", item.id, fileName || "");
+    if (!filePath.startsWith(expectedPrefix) || !fileName) { send(res, 404, { error: "Installer artifact is missing." }); return; }
+    try {
+      const artifact = await readFile(filePath);
+      const digest = createHash("sha256").update(artifact).digest("hex");
+      const expectedDigest = packageDownload[2] === "msi" ? item.msi_sha256 : item.setup_sha256;
+      if (digest !== expectedDigest) { send(res, 503, { error: "Installer integrity check failed." }); return; }
+      audit("installer.package_downloaded", session.id, item.id, JSON.stringify({ format: packageDownload[2], sha256: digest }));
+      res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": artifact.length, "Content-Disposition": `attachment; filename="${path.basename(fileName)}"`, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+      res.end(artifact);
+    } catch { send(res, 404, { error: "Installer artifact is missing." }); }
+    return;
+  }
+  const revokePackage = route.match(/^\/api\/installer-packages\/([a-f0-9]{32})\/revoke$/);
+  if (revokePackage && req.method === "POST") {
+    const item = db.prepare("SELECT grant_id FROM installer_packages WHERE id=? AND revoked_at IS NULL").get(revokePackage[1]);
+    if (!item) { send(res, 404, { error: "Active installer package not found." }); return; }
+    const now = new Date().toISOString();
+    db.prepare("UPDATE enrollment_grants SET revoked_at=? WHERE id=? AND revoked_at IS NULL").run(now, item.grant_id);
+    db.prepare("UPDATE installer_packages SET revoked_at=? WHERE grant_id=? AND revoked_at IS NULL").run(now, item.grant_id);
+    audit("installer.package_revoked", session.id, revokePackage[1], JSON.stringify({ grantId: item.grant_id }));
     send(res, 200, { ok: true }); return;
   }
   if (route === "/api/overview" && req.method === "GET") {

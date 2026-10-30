@@ -4,9 +4,9 @@ Self-hosted remote monitoring and management for devices you are authorized to a
 
 ## Current working slice
 
-The runnable application includes a protected owner setup/sign-in flow, a local API, a SQLite development database, polished Overview and Devices inventory pages, an Enrollment page, and an Audit log. Dashboard counts, device search, sorting, status filtering, export, device details, policy management, signed authorization issuance, pending approval/rejection, authorization revocation, and audit filtering use real API/database operations. Agent enrollment, signed heartbeat ingestion, hardware inventory fields and software inventory ingestion are covered by API integration tests. No sample devices are inserted; inventory remains empty until an authorized agent enrolls and checks in.
+The runnable application includes a protected owner setup/sign-in flow, a local API, a SQLite development database, Overview and Devices inventory pages, Enrollment, and Audit. The administrator can create policy-limited enrollment grants and build actual Windows MSI and graphical EXE installer packages. The Windows service agent enrolls automatically with a device-specific key, checks in, and reports hardware and installed software inventory. Package generation, download, grant revocation, and agent-to-API enrollment/inventory are covered by the end-to-end API test. No sample devices are inserted.
 
-This is an active build, not a production release. The enrollment protocol and server APIs are implemented, but there is not yet a Windows agent or a dashboard-downloadable MSI. MSI generation, signing, Windows service lifecycle and clean-VM acceptance, PostgreSQL/Docker deployment, task execution, and ScreenConnect remain on the roadmap. The Enrollment page clearly identifies the installer as unavailable until the packaging pipeline exists.
+This is an active build, not a production release. Local development builds are unsigned and point to the local development server. Production package creation fails closed unless Authenticode signing is configured. A clean Windows 10/11 graphical install/upgrade/repair/uninstall acceptance run and live ScreenConnect integration remain release gates. PostgreSQL/Docker deployment and remote task execution also remain on the roadmap. See [Windows agent packaging and release](docs/windows-agent-release.md) and [the architecture and delivery plan](docs/architecture-roadmap.md) for constraints and status.
 
 ## Run on Windows
 
@@ -28,8 +28,8 @@ npm.cmd test
 npm.cmd run build
 ```
 
-The API test uses an isolated temporary SQLite database and verifies owner setup, origin checking, password validation, session cookies, protected reads, CSRF, logout/login, policy and grant issuance, signed multi-device enrollment quotas, heartbeat and hardware/software inventory ingestion, replay rejection, pending approval, and device revocation. It does not insert devices into the development database.
+The API test uses an isolated temporary SQLite database. It verifies owner setup/auth, enrollment policy and grants, quota/expiry/revocation, builds real MSI and EXE files, checks downloads, runs the .NET agent self-check and enrollment/check-in harness against the live test API, verifies hardware/software inventory, and confirms revoked packages cannot be downloaded. It does not insert devices into the development database.
 
 ## Production status
 
-Do not expose the current development server to the internet. Before production use, the platform still needs the approved roadmap's production database/deployment, TLS/reverse proxy, account and role management, enrollment policies, authenticated Windows agent, downloadable signed MSI pipeline, remote task controls, ScreenConnect adapter and real-device acceptance testing. Follow [the architecture and delivery plan](docs/architecture-roadmap.md) for status and security decisions.
+Do not expose the current development server to the internet. For multi-computer distribution, configure `RMM_SERVER_URL` to the publicly reachable HTTPS RMM URL before building packages; a package built with `127.0.0.1` can only reach that same computer. ScreenConnect's supported integration methods need to be confirmed from the user's licensed instance documentation before implementing a live connector; do not guess API endpoints. Follow [the architecture and delivery plan](docs/architecture-roadmap.md) for status and security decisions.
