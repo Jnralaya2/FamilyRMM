@@ -90,6 +90,15 @@ public static class WindowsInventory
     }
     private static int? TotalMemoryMb()
     {
+#if AGENT_TEST_HARNESS
+        if (OperatingSystem.IsLinux())
+        {
+            var availableMemoryBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            return availableMemoryBytes > 0
+                ? checked((int)Math.Min(availableMemoryBytes / (1024L * 1024L), int.MaxValue))
+                : null;
+        }
+#endif
         try { return GetPhysicallyInstalledSystemMemory(out var kilobytes) && kilobytes > 0 ? checked((int)Math.Min(kilobytes / 1024, int.MaxValue)) : null; }
         catch { return null; }
     }
