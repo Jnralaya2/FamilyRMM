@@ -18,6 +18,7 @@ failed_app_id=
 failed_image_id=
 failed_image_tag=
 restored_caddy_id=
+latest_tmp=
 old_image_id=
 old_caddy_image_id=
 old_caddy_container_id=
@@ -101,6 +102,7 @@ restore_previous() {
 automatic_rollback() {
   status=$?
   trap - EXIT
+  if [ -n "$latest_tmp" ]; then rm -f -- "$latest_tmp"; fi
   if [ "$image_probe_ready" -eq 1 ]; then
     docker rm -f "$image_probe_container" >/dev/null 2>&1 || true
     rm -rf -- "$image_probe_dir"
@@ -184,8 +186,8 @@ tar -czf "$backup_dir/project.tar.gz" \
   --exclude=./.dotnet-cli --exclude=./.nuget --exclude=./data \
   --exclude=./agent/bin --exclude=./agent/obj --exclude=./.deploy-bundle\* \
   -C "$app_dir" .
-chmod 600 "$backup_dir/project.tar.gz"
 [ -s "$backup_dir/project.tar.gz" ] || fail 'The source archive is missing or empty; refusing to deploy.'
+chmod 600 "$backup_dir/project.tar.gz"
 archive_contents=$(tar -tzf "$backup_dir/project.tar.gz") || fail 'The source archive failed validation; refusing to deploy.'
 for archived_path in ./docker-compose.yml ./.env ./secrets/enrollment-private-key.pem ./deploy/Caddyfile; do
   printf '%s\n' "$archive_contents" | grep -Fqx "$archived_path" || fail "Required recovery file is missing from the source archive: $archived_path"
@@ -209,8 +211,8 @@ printf '%s\n' '2' > "$backup_dir/backup-format-version"
 docker exec "$app_id" node --input-type=module -e "import { mkdir } from 'node:fs/promises'; import { DatabaseSync } from 'node:sqlite'; await mkdir('/var/lib/family-rmm/backups', { recursive: true }); const db = new DatabaseSync('/var/lib/family-rmm/rmm.sqlite'); db.exec(\"VACUUM INTO '$db_backup_in_volume'\"); db.close();"
 docker exec "$app_id" test -s "$db_backup_in_volume" || fail 'SQLite snapshot was not created or is empty; refusing to deploy.'
 docker cp "$app_id:$db_backup_in_volume" "$backup_dir/database.sqlite"
+[ -s "$backup_dir/database.sqlite" ] || fail 'Copied SQLite snapshot is missing or empty; refusing to deploy.'
 chmod 600 "$backup_dir/database.sqlite"
- [ -s "$backup_dir/database.sqlite" ] || fail 'Copied SQLite snapshot is missing or empty; refusing to deploy.'
 (cd "$backup_dir" && sha256sum database.sqlite > database.sqlite.sha256)
 chmod 600 "$backup_dir/database.sqlite.sha256"
 (cd "$backup_dir" && sha256sum -c database.sqlite.sha256) || fail 'SQLite snapshot SHA-256 validation failed; refusing to deploy.'
@@ -221,8 +223,16 @@ done
 docker image inspect "$(cat "$backup_dir/old-image-id")" >/dev/null || fail 'Recorded previous app image failed validation; refusing to deploy.'
 docker image inspect "$(cat "$backup_dir/old-caddy-image-id")" >/dev/null || fail 'Recorded previous Caddy image failed validation; refusing to deploy.'
 tar -tzf "$backup_dir/project.tar.gz" >/dev/null || fail 'Recorded source archive failed its final validation; refusing to deploy.'
-printf '%s\n' "$backup_dir" > "$backup_root/LATEST"
-chmod 600 "$backup_root/LATEST"
+# LATEST is a regular text pointer containing the selected backup directory.
+# Replace it atomically only after all recovery materials have passed validation.
+if [ -e "$backup_root/LATEST" ] && { [ ! -f "$backup_root/LATEST" ] || [ -L "$backup_root/LATEST" ]; }; then
+  fail "The LATEST pointer exists but is not a regular file: $backup_root/LATEST"
+fi
+latest_tmp=$backup_root/.LATEST-$stamp-$$
+printf '%s\n' "$backup_dir" > "$latest_tmp"
+chmod 600 "$latest_tmp"
+mv -f -- "$latest_tmp" "$backup_root/LATEST"
+latest_tmp=
 rollback_ready=1
 trap automatic_rollback EXIT
 

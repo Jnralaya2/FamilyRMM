@@ -41,6 +41,9 @@ async function fixture() {
   const mockRoot = path.join(temp, "mock");
   const binDir = path.join(temp, "bin");
   await Promise.all([appDir, backupRoot, volumeRoot, mockRoot, binDir].map((dir) => mkdir(dir, { recursive: true })));
+  // Initialize mock state before any command runs. Preflight failures can happen
+  // before Docker is invoked, and their assertions still need a valid baseline.
+  await writeFile(path.join(mockRoot, "state.json"), JSON.stringify({ app: "old", caddy: "old", up: 0, health: 0, validations: 0, tags: [] }));
   await mkdir(path.join(appDir, "deploy"), { recursive: true });
   await mkdir(path.join(appDir, "secrets"), { recursive: true });
   await writeFile(path.join(appDir, "docker-compose.yml"), "services:\n  app: {}\n  caddy: {}\n");
@@ -92,7 +95,7 @@ if(a[0]==="inspect"&&a[1]==="-f"){
  if(fmt.includes(".State.Health")){
    if(id==="app-old"){print("healthy");process.exit(0);}
    s.health++; save();
-   if(process.env.MOCK_NEW_HEALTH_FAILURE==="1"&&s.health>1){s.app="exited";save();print("exited");process.exit(0);}
+   if(process.env.MOCK_NEW_HEALTH_FAILURE==="1"&&s.health>=1){s.app="exited";save();print("exited");process.exit(0);}
    print("healthy");process.exit(0);
  }
  fail("unknown inspect format");
@@ -176,7 +179,9 @@ fail("unhandled docker mock command: "+a.join(" "));
   const run = (script, args = [], extraEnv = {}) => spawnSync("sh", [script, ...args], { cwd: appDir, env: { ...env, ...extraEnv }, encoding: "utf8", timeout: 60_000 });
   const readState = async () => JSON.parse(await readFile(path.join(mockRoot, "state.json"), "utf8"));
   const readDockerLog = async () => (await readFile(path.join(mockRoot, "docker.jsonl"), "utf8").catch(() => "")).split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
-  const backupDir = async () => (await (await import("node:fs/promises")).readdir(backupRoot)).map((name) => path.join(backupRoot, name)).find((name) => name.includes("deploy-"));
+  const backupDir = async () => (await (await import("node:fs/promises")).readdir(backupRoot))
+    .filter((name) => name.startsWith("deploy-") && name !== "LATEST")
+    .map((name) => path.join(backupRoot, name))[0];
   return { temp, appDir, backupRoot, volumeRoot, mockRoot, deployScript, rollbackScript, bundlePath, env, run, readState, readDockerLog, backupDir };
 }
 
@@ -196,6 +201,7 @@ testRelease("release accepts a complete, checksummed, integrity-checked backup",
   for (const name of ["project.tar.gz", "database.sqlite", "database.sqlite.sha256", "old-image-id", "old-caddy-image-id", "compose-image", "caddy-compose-image", "rollback-image", "rollback-caddy-image", "data-volume", "backup-format-version"]) {
     const stat = await (await import("node:fs/promises")).stat(path.join(backup, name)); assert.ok(stat.size > 0, `${name} must exist and be nonempty`);
   }
+  assert.equal(await readFile(path.join(f.backupRoot, "LATEST"), "utf8"), `${backup}\n`, "LATEST is a regular text file pointing to the validated backup directory");
   assert.match(result.stdout, /DEPLOYMENT_OK/);
 });
 
@@ -232,8 +238,11 @@ testRelease("image build failure restores source and the still-running previous 
 
 testRelease("new application health failure restores the old application", { MOCK_NEW_HEALTH_FAILURE: "1" }, async (f, result) => {
   assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Updated app did not become healthy/i);
   assert.match(result.stderr, /Rollback completed/);
-  assert.equal((await f.readState()).app, "old");
+  const state = await f.readState();
+  assert.equal(state.health, 1, "the newly started app received and failed its health check");
+  assert.equal(state.app, "old", "the old app was restored after the new app failed health validation");
 });
 
 testRelease("Caddy validation failure restores the old application and proxy", { MOCK_CADDY_VALIDATION_FAILURE: "1" }, async (f, result) => {
