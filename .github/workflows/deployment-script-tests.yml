@@ -35,7 +35,8 @@ jobs:
       - name: Install Windows installer validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y msitools
+          sudo apt-get install --no-install-recommends -y msitools wixl
+          command -v wixl
 
       - name: Install locked dependencies
         run: npm ci
@@ -45,6 +46,9 @@ jobs:
 
       - name: Restore Windows bootstrapper dependencies
         run: dotnet restore agent/FamilyRmm.Bootstrapper/FamilyRmm.Bootstrapper.csproj -p:EnableWindowsTargeting=true
+
+      - name: Restore cross-platform agent policy test dependencies
+        run: dotnet restore agent/FamilyRmm.Agent/FamilyRmm.Agent.csproj -p:TargetFramework=net10.0 -p:RuntimeIdentifier=linux-x64 -p:SelfContained=false -p:UseAppHost=false -p:PublishSingleFile=false -p:EnableWindowsTargeting=true -p:EnableAgentTestHarness=true -p:BaseIntermediateOutputPath=${{ github.workspace }}/agent/FamilyRmm.Agent/obj/ -p:MSBuildProjectExtensionsPath=${{ github.workspace }}/agent/FamilyRmm.Agent/obj/linux-policy-self-test/
 
       - name: Type check
         run: npm run check
