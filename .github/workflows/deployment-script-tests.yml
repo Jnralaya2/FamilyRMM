@@ -13,7 +13,10 @@ jobs:
   deployment-script-tests:
     name: Type check, build, and full test suite
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
+    env:
+      DOTNET_CLI_HOME: ${{ github.workspace }}/.dotnet-cli
+      NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -24,8 +27,24 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install Windows installer validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y msitools
+
       - name: Install locked dependencies
         run: npm ci
+
+      - name: Restore Windows agent dependencies
+        run: dotnet restore agent/FamilyRmm.Agent/FamilyRmm.Agent.csproj -p:EnableWindowsTargeting=true -p:EnableAgentTestHarness=true
+
+      - name: Restore Windows bootstrapper dependencies
+        run: dotnet restore agent/FamilyRmm.Bootstrapper/FamilyRmm.Bootstrapper.csproj -p:EnableWindowsTargeting=true
 
       - name: Type check
         run: npm run check

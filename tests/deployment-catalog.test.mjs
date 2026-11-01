@@ -75,10 +75,25 @@ test("vendor downloads enforce size while streaming and honor body timeouts", as
   const application = { installerUrl: "https://zoom.us/client.exe", allowedHosts: ["zoom.us"], packageType: "exe", expectedSha256: "a".repeat(64), id: "zoom" };
   const oversized = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(4)); controller.enqueue(new Uint8Array(8)); controller.close(); } });
   await assert.rejects(downloadCatalogInstaller(application, async () => new Response(oversized), { maxBytes: 8 }), /250 MiB package limit/);
-  const stalledFetcher = async (_url, options) => new Promise((resolve, reject) => options.signal.addEventListener("abort", () => reject(options.signal.reason), { once: true }));
+  const stalledFetcher = async (_url, options) => new Promise((resolve, reject) => {
+    // AbortSignal.timeout uses an unreferenced timer. Keep the test process
+    // alive while this mock waits solely for that signal (as real fetch I/O would).
+    const keepAlive = setTimeout(() => {}, 10_000);
+    options.signal.addEventListener("abort", () => {
+      clearTimeout(keepAlive);
+      reject(options.signal.reason);
+    }, { once: true });
+  });
   await assert.rejects(downloadCatalogInstaller(application, stalledFetcher, { timeoutMs: 10 }), /abort|timed out/i);
   const stalledBodyFetcher = async (_url, { signal }) => new Response(new ReadableStream({
-    start(controller) { signal.addEventListener("abort", () => controller.error(signal.reason), { once: true }); },
+    start(controller) {
+      // A stalled mocked body has no socket handle to keep the event loop alive.
+      const keepAlive = setTimeout(() => {}, 10_000);
+      signal.addEventListener("abort", () => {
+        clearTimeout(keepAlive);
+        controller.error(signal.reason);
+      }, { once: true });
+    },
   }));
   await assert.rejects(downloadCatalogInstaller(application, stalledBodyFetcher, { timeoutMs: 10 }), /abort|timed out/i);
 });
