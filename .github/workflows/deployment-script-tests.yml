@@ -1,4 +1,4 @@
-name: Deployment script safety tests
+name: Ubuntu checks and tests
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   deployment-script-tests:
-    name: Mocked deployment and rollback scenarios
+    name: Type check, build, and full test suite
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -27,7 +27,13 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
-      - name: Run deployment script integration tests
+      - name: Type check
+        run: npm run check
+
+      - name: Build production dashboard
+        run: npm run build
+
+      - name: Run full test suite (including POSIX deployment tests)
         env:
           REQUIRE_POSIX_DEPLOYMENT_TESTS: "1"
-        run: node --test tests/deployment-scripts.test.mjs
+        run: npm test
