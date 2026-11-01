@@ -9,7 +9,7 @@
     <PublishSingleFile>true</PublishSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
-    <Version>0.1.0</Version>
+    <Version>0.2.4</Version>
     <MsiPath Condition="'$(MsiPath)' == ''">$(MSBuildProjectDirectory)\..\..\.artifacts\FamilyRmmAgent.msi</MsiPath>
   </PropertyGroup>
   <ItemGroup>

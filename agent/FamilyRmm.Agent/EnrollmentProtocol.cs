@@ -1,6 +1,7 @@
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 
 namespace FamilyRmm.Agent;
@@ -19,17 +20,22 @@ public static class EnrollmentProtocol
             ?? throw new InvalidOperationException("The RMM server returned an invalid enrollment key.");
         if (key.Algorithm != "ECDSA-P256-SHA256" || key.ServerUrl.TrimEnd('/') != options.ServerUrl)
             throw new InvalidOperationException("The installer grant targets a different RMM server or signing algorithm.");
-        var manifest = options.EnrollmentGrant.GetProperty("manifest");
-        if (manifest.GetProperty("serverUrl").GetString()?.TrimEnd('/') != options.ServerUrl ||
-            manifest.GetProperty("audience").GetString()?.TrimEnd('/') != options.ServerUrl ||
-            manifest.GetProperty("version").GetInt32() != 1 ||
-            manifest.GetProperty("expiresAt").GetDateTimeOffset() <= DateTimeOffset.UtcNow)
-            throw new InvalidOperationException("The enrollment authorization is expired or belongs to another RMM server.");
-        var signatureText = options.EnrollmentGrant.GetProperty("signature").GetString() ?? "";
-        using var serverKey = ECDsa.Create();
-        serverKey.ImportFromPem(key.PublicKey);
-        if (!serverKey.VerifyData(CanonicalJson(manifest), FromBase64Url(signatureText), HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence))
-            throw new InvalidOperationException("The enrollment authorization signature is invalid.");
+        if (!string.IsNullOrWhiteSpace(options.TaskSigningPublicKey) && options.TaskSigningPublicKey.Trim() != key.PublicKey.Trim())
+            throw new InvalidOperationException("The server deployment signing key differs from the key pinned in the installer.");
+        if (options.HasEnrollmentGrant)
+        {
+            var manifest = options.EnrollmentGrant.GetProperty("manifest");
+            if (manifest.GetProperty("serverUrl").GetString()?.TrimEnd('/') != options.ServerUrl ||
+                manifest.GetProperty("audience").GetString()?.TrimEnd('/') != options.ServerUrl ||
+                manifest.GetProperty("version").GetInt32() != 1 ||
+                manifest.GetProperty("expiresAt").GetDateTimeOffset() <= DateTimeOffset.UtcNow)
+                throw new InvalidOperationException("The enrollment authorization is expired or belongs to another RMM server.");
+            var signatureText = options.EnrollmentGrant.GetProperty("signature").GetString() ?? "";
+            using var serverKey = ECDsa.Create();
+            serverKey.ImportFromPem(key.PublicKey);
+            if (!serverKey.VerifyData(CanonicalJson(manifest), FromBase64Url(signatureText), HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence))
+                throw new InvalidOperationException("The enrollment authorization signature is invalid.");
+        }
         return key;
     }
 
@@ -39,12 +45,14 @@ public static class EnrollmentProtocol
         var identity = identities.Current;
         var nonce = ToBase64Url(RandomNumberGenerator.GetBytes(24));
         var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var manifest = options.EnrollmentGrant.GetProperty("manifest");
-        var proofMessage = Encoding.UTF8.GetBytes($"{manifest.GetProperty("grantId").GetString()}\n{identity.DeviceId}\n{timestamp}\n{nonce}");
+        var grantId = options.HasEnrollmentGrant ? options.EnrollmentGrant.GetProperty("manifest").GetProperty("grantId").GetString() : null;
+        var proofMessage = Encoding.UTF8.GetBytes(options.HasEnrollmentGrant
+            ? $"{grantId}\n{identity.DeviceId}\n{timestamp}\n{nonce}"
+            : $"{identity.DeviceId}\n{timestamp}\n{nonce}");
         var proof = ToBase64Url(identityKey.SignData(proofMessage, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence));
         var payload = new
         {
-            enrollmentGrant = options.EnrollmentGrant,
+            enrollmentGrant = options.HasEnrollmentGrant ? options.EnrollmentGrant : (JsonElement?)null,
             deviceId = identity.DeviceId,
             name = Environment.MachineName,
             operatingSystem = "Windows",
@@ -68,6 +76,26 @@ public static class EnrollmentProtocol
             ?? throw new InvalidOperationException("The RMM server returned an invalid enrollment response.");
     }
 
+    public static async Task<string> GetEnrollmentStatusAsync(HttpClient client, AgentIdentityStore identities, ECDsa key, AgentOptions options, CancellationToken cancellationToken)
+    {
+        using var response = await SendSignedAsync(client, HttpMethod.Post, $"{options.ServerUrl}/api/agent/enroll/status", "{}"u8.ToArray(), identities.Current.DeviceId, key, cancellationToken);
+        if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+        {
+            var responseText = await response.Content.ReadAsStringAsync(cancellationToken);
+            var error = "The device is not authorized.";
+            try
+            {
+                using var errorJson = JsonDocument.Parse(responseText);
+                if (errorJson.RootElement.TryGetProperty("error", out var message)) error = message.GetString() ?? error;
+            }
+            catch { /* Keep the bounded default message for non-JSON responses. */ }
+            throw new HttpRequestException($"Enrollment status was rejected: {error}", null, response.StatusCode);
+        }
+        response.EnsureSuccessStatusCode();
+        using var status = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(cancellationToken), cancellationToken: cancellationToken);
+        return status.RootElement.GetProperty("status").GetString() ?? "pending";
+    }
+
     public static async Task<HttpResponseMessage> SendSignedAsync(HttpClient client, HttpMethod method, string url, byte[] body, string deviceId, ECDsa key, CancellationToken cancellationToken)
     {
         var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -89,7 +117,7 @@ public static class EnrollmentProtocol
     public static byte[] CanonicalJson(JsonElement element)
     {
         using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream)) WriteCanonical(writer, element);
+        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping })) WriteCanonical(writer, element);
         return stream.ToArray();
     }
 

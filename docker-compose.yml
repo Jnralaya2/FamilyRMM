@@ -1,0 +1,61 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      RMM_ENV: production
+      RMM_HOST: 0.0.0.0
+      RMM_PORT: 3000
+      RMM_SERVER_URL: https://${RMM_PUBLIC_HOST}
+      RMM_DB_PATH: /var/lib/family-rmm/rmm.sqlite
+      RMM_ARTIFACTS_DIR: /var/lib/family-rmm/artifacts
+      RMM_SETUP_TOKEN: ${RMM_SETUP_TOKEN}
+      RMM_COOKIE_SECURE: "1"
+      RMM_ENROLLMENT_PRIVATE_KEY_FILE: /run/secrets/enrollment_private_key
+    secrets:
+      - enrollment_private_key
+    volumes:
+      - rmm_data:/var/lib/family-rmm
+    networks:
+      - private
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      RMM_PUBLIC_HOST: ${RMM_PUBLIC_HOST}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      private: {}
+      egress:
+        gw_priority: 1
+
+secrets:
+  enrollment_private_key:
+    file: ./secrets/enrollment-private-key.pem
+
+volumes:
+  rmm_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  private:
+    internal: true
+  egress:
+    driver: bridge

@@ -33,7 +33,7 @@
                       ErrorControl="normal"
                       Account="LocalSystem"
                       Vital="yes" />
-      <ServiceControl Id="AgentServiceControl" Name="FamilyRmmAgent" Stop="both" Remove="uninstall" Wait="yes" />
+      <ServiceControl Id="AgentServiceControl" Name="FamilyRmmAgent" Stop="both" Start="install" Remove="uninstall" Wait="yes" />
     </Component>
 
     <Component Id="AgentStateComponent" Directory="RmmProgramData" Guid="*" Condition="NOT UPGRADINGPRODUCTCODE">

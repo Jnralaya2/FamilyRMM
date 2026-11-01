@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+secrets/
+data/
+.logs/
+.artifacts/
+.dotnet-cli/
+.nuget/
+node_modules/
+agent/**/bin/
+agent/**/obj/
+*.tsbuildinfo

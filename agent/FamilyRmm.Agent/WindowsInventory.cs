@@ -56,6 +56,22 @@ public static class WindowsInventory
             catch (System.Security.SecurityException) { }
             catch (IOException) { }
         }
+        // Teams is delivered as an MSIX app and is not consistently registered
+        // in the classic Uninstall registry. AppxAllUserStore exposes the
+        // provisioned/all-user package identity to the LocalSystem service.
+        try
+        {
+            using var appx = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Applications");
+            foreach (var packageName in appx?.GetSubKeyNames() ?? [])
+            {
+                if (!packageName.StartsWith("MSTeams_", StringComparison.OrdinalIgnoreCase)) continue;
+                var version = packageName.Split('_').ElementAtOrDefault(1);
+                if (string.IsNullOrWhiteSpace(version)) continue;
+                items[$"Microsoft Teams|{version}"] = new SoftwareItem("Microsoft Teams", Limit(version, 120), "Microsoft Corporation", null);
+            }
+        }
+        catch (System.Security.SecurityException) { }
+        catch (IOException) { }
         return items.Values.OrderBy(app => app.name, StringComparer.OrdinalIgnoreCase).Take(10_000).ToArray();
     }
 

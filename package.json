@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "start": "node --env-file-if-exists=.env src/server/index.mjs",
     "check": "tsc --noEmit",
-    "test": "node --test"
+    "test": "node --test --test-concurrency=1",
+    "test:unsigned-pilot": "node tests/unsigned-pilot-smoke.mjs"
   },
   "dependencies": {
     "lucide-react": "^1.65.0",

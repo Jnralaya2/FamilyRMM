@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Family RMM Agent"
+           Language="1033"
+           Version="$(var.ProductVersion)"
+           Manufacturer="Family Systems"
+           UpgradeCode="5F0BFE5A-A25F-4F70-B9C7-EE9D6B64F8E1">
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="Family RMM Windows endpoint agent"
+             Manufacturer="Family Systems" />
+    <Media Id="1" Cabinet="FamilyRmmAgent.cab" EmbedCab="yes" />
+    <MajorUpgrade DowngradeErrorMessage="A newer Family RMM Agent is already installed." />
+
+    <Feature Id="AgentFeature" Title="Family RMM Agent" Level="1">
+      <ComponentRef Id="AgentServiceComponent" />
+      <ComponentRef Id="AgentStateComponent" />
+    </Feature>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Family RMM Agent">
+          <Component Id="AgentServiceComponent" Guid="*">
+            <File Id="AgentExecutable" Source="$(var.AgentExe)" KeyPath="yes" />
+            <File Id="AgentConfiguration" Source="$(var.AgentConfig)" Name="rmm-agent.json" />
+            <ServiceInstall Id="AgentServiceInstall"
+                            Name="FamilyRmmAgent"
+                            DisplayName="Family RMM Agent"
+                            Description="Securely reports computer inventory to the configured Family RMM server."
+                            Type="ownProcess"
+                            Start="auto"
+                            ErrorControl="normal"
+                            Account="LocalSystem"
+                            Vital="yes" />
+            <ServiceControl Id="AgentServiceControl" Name="FamilyRmmAgent" Stop="both" Start="install" Remove="uninstall" Wait="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+
+      <Directory Id="CommonAppDataFolder">
+        <Directory Id="RmmProgramData" Name="FamilyRMM">
+          <Component Id="AgentStateComponent" Guid="*">
+            <Condition>NOT UPGRADINGPRODUCTCODE</Condition>
+            <CreateFolder />
+            <RegistryValue Root="HKLM" Key="Software\Family Systems\Family RMM Agent" Name="StateDirectory" Type="integer" Value="1" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+  </Product>
+</Wix>

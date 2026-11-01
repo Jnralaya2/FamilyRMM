@@ -56,12 +56,23 @@ public sealed class AgentIdentityStore : IDisposable
     public void MarkEnrolled()
     {
         if (IsEnrolled) return;
+        WriteEnrollmentState(true);
+    }
+
+    public void MarkEnrollmentPending()
+    {
+        if (!IsEnrolled) return;
+        WriteEnrollmentState(false);
+    }
+
+    private void WriteEnrollmentState(bool enrolled)
+    {
         var path = Path.Combine(_directory, "device-identity.json");
-        var state = new PersistedIdentity(Current.DeviceId, Current.EncryptedPrivateKey, true);
+        var state = new PersistedIdentity(Current.DeviceId, Current.EncryptedPrivateKey, enrolled);
         var temporaryPath = path + ".tmp";
         File.WriteAllBytes(temporaryPath, JsonSerializer.SerializeToUtf8Bytes(state));
         File.Move(temporaryPath, path, true);
-        IsEnrolled = true;
+        IsEnrolled = enrolled;
     }
 
     public void Dispose()

@@ -1,26 +1,25 @@
 # Windows agent packaging and release
 
-## What the dashboard builds
+## Dashboard downloads
 
-The Enrollment page issues a signed, policy-limited authorization and builds two actual artifacts:
+The **Downloads** page builds a reusable Windows MSI and graphical EXE from the checked-in .NET Windows service agent. In production, the Family RMM server queues and runs the build with its .NET SDK and GNOME msitools compiler; it does not require a paired Windows PC or a separate worker command. Local Windows builds use WiX when available. The page starts the first generic package build automatically and shows downloads when both artifacts are ready. Package links are stable and package scoped. On the configured HTTPS origin, the package endpoint verifies the stored artifact hash before sending it. Downloading a package does not authorize a computer.
 
-- `FamilyRmmAgent-<version>.msi`: per-machine Windows Installer package that installs the `Family RMM Agent` automatic service.
-- `FamilyRmmAgentSetup-<version>.exe`: graphical bootstrapper that extracts the MSI to a temporary directory and opens the normal Windows MSI wizard. It requests elevation through the standard Windows UAC mechanism when needed.
+The generic package contains the server URL, agent version, and public task-signing key only. It contains no administrator credential, permanent enrollment grant, or private signing key. On first service start, the agent creates a device key protected with machine-scope Windows DPAPI, submits a proof-of-possession enrollment request, and reports its Windows hardware/OS and installed software inventory only after approval. New requests appear under **Enrollment** for an administrator to approve or reject. Approval makes the device manageable; rejection or device revocation prevents authenticated check-ins. The service starts automatically and continues retrying enrollment while approval is pending.
 
-Both downloads are administrator-authenticated, integrity-checked against the stored SHA-256 hash, and denied after the associated enrollment grant expires, reaches quota, or is revoked. The enrollment recipient does not enter a code. The package contains a signed, non-secret authorization manifest; each agent creates its own key pair on first run, protects the private key using machine-scope Windows DPAPI, and proves possession during registration.
+The dashboard also retains policy-grant packages for workflows that need signed, time-limited authorization. Legacy grants do not impose device or package download caps. They may expire or be revoked for enrollment, independently of stable package download links.
 
-The service reports its version and computer inventory to the configured server. The test suite builds and downloads both artifacts, checks the installer file signatures, validates the signed manifest with the published server key, then runs the actual .NET agent's self-check and test enrollment/check-in against the test API.
+## Server address and HTTPS
 
-## Server address and distribution
-
-Set `RMM_SERVER_URL` to the reachable RMM HTTPS origin before starting the server and generating packages. In local development it defaults to `http://127.0.0.1:3001`; an installer built with this URL cannot connect to another computer's loopback. Production startup rejects loopback or non-HTTPS URLs.
+Set `RMM_SERVER_URL` to the public HTTPS origin before starting the server and building packages. Production startup rejects loopback and non-HTTPS URLs. The MSI is not a universal binary: it is configured for the FamilyRMM server that built it. Verify DNS, TLS, and the public enrollment key on the target deployment before distributing a release.
 
 ## Authenticode
 
-Development builds are intentionally unsigned and explicitly labeled as such in the dashboard. Production package creation fails closed without signing configuration. The build pipeline signs the agent executable, MSI, and graphical setup EXE with SHA-256 and an RFC 3161 timestamp, then verifies the signatures. Configure `RMM_SIGNTOOL_PATH`, `RMM_SIGN_CERT_THUMBPRINT`, and optionally `RMM_TIMESTAMP_URL` on an isolated release/signing worker. Keep the certificate private key in a hardware-backed key store or managed signing service; do not put it in this repository or on the public RMM web server. The current local SignTool adapter is a release-worker integration point, not a claim that a signing service or certificate is configured here.
+Current production pilot builds are unsigned and labeled as such in the dashboard. Windows may show an unknown-publisher warning. Configure `RMM_SIGNTOOL_PATH`, `RMM_SIGN_CERT_THUMBPRINT`, and optionally `RMM_TIMESTAMP_URL` on an isolated release/signing worker before public distribution. Keep the certificate private key in a hardware-backed key store or managed signing service; do not put it in this repository or on the public web server. No production certificate or signing service is configured here.
 
-A signing certificate proves publisher identity and protects artifact integrity; it does not guarantee immediate SmartScreen reputation. EV certificates can provide publisher validation but SmartScreen may still apply reputation-based checks. Use a trusted public code-signing certificate, consistent publisher metadata, timestamp signatures, and a gradual controlled rollout. Verify SmartScreen and Windows 10/11 GUI behavior on clean test machines before public distribution.
+An Authenticode signature identifies the publisher and protects artifact integrity; SmartScreen reputation may still be limited for a new release. Verify signatures and Windows 10/11 GUI behavior on clean test machines before public distribution.
 
-## Acceptance still required
+## Acceptance and release gates
 
-The current environment has not installed the MSI in a clean Windows 10/11 VM. Release acceptance must exercise GUI install and UAC, service startup after reboot, server registration and inventory, MSI upgrade, repair, uninstall, reinstall, and expired/revoked grants. Development self-check and API tests are not substitutes for those Windows Installer lifecycle checks. ScreenConnect association/session deployment is a separate integration gate documented in the roadmap.
+The API integration tests build real MSI and EXE artifacts, download them and check their file signatures. They exercise both the agent against an isolated test API and the production-mode server-side build queue without a separate worker. They do not install MSI in a clean Windows VM. The live API reports healthy, but the live frontend was observed serving an older bundle; a new cache-disabled deployment is required and must pass the asset fingerprint check before live dashboard visibility is claimed.
+
+Before calling a Windows release complete, install the generated MSI on a clean Windows 10/11 VM with UAC, verify automatic service startup after reboot, enrollment approval, inventory, MSI upgrade/repair, uninstall and cleanup. ScreenConnect association and session deployment have not been implemented or tested; see the architecture roadmap. Do not claim a live ScreenConnect session based only on an installer artifact.
