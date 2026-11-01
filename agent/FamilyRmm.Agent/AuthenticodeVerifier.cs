@@ -22,7 +22,14 @@ public static class AuthenticodeVerifier
 
     public static string VerifyPublisher(string filePath, string expectedPublisher)
     {
-        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Authenticode verification requires Windows.");
+        if (!OperatingSystem.IsWindows())
+        {
+#if AGENT_TEST_HARNESS
+            throw new CryptographicException($"No trusted package signer matched the approved publisher '{expectedPublisher}' (Authenticode verification is only available on Windows).");
+#else
+            throw new PlatformNotSupportedException("Authenticode verification requires Windows.");
+#endif
+        }
         if (string.IsNullOrWhiteSpace(expectedPublisher) || expectedPublisher.Length > 200)
             throw new CryptographicException("The signed deployment task has no valid expected publisher.");
 

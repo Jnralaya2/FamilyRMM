@@ -27,6 +27,9 @@ public static class WindowsInventory
 
     public static IReadOnlyList<SoftwareItem> Software()
     {
+#if AGENT_TEST_HARNESS
+        if (!OperatingSystem.IsWindows()) return [];
+#endif
         var items = new Dictionary<string, SoftwareItem>(StringComparer.OrdinalIgnoreCase);
         foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
         {

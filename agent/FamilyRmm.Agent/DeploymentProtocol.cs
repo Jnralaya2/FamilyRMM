@@ -104,7 +104,13 @@ public static class DeploymentProtocol
                 var actualHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(script))).ToLowerInvariant();
                 if (!CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(actualHash), Encoding.ASCII.GetBytes(declaredHash))) throw new CryptographicException("The signed script hash is invalid.");
                 await File.WriteAllTextAsync(artifactPath, script, new UTF8Encoding(false), linked.Token);
+#if AGENT_TEST_HARNESS
+                processInfo.FileName = OperatingSystem.IsWindows()
+                    ? Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe")
+                    : "pwsh";
+#else
                 processInfo.FileName = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+#endif
                 foreach (var arg in new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", artifactPath }) processInfo.ArgumentList.Add(arg);
             }
 

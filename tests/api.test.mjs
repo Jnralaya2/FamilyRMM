@@ -4,7 +4,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:net";
 import { rm } from "node:fs/promises";
 import path from "node:path";
-import { generateKeyPairSync, sign } from "node:crypto";
+import { generateKeyPairSync, randomBytes, sign } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
 const root = process.cwd();
@@ -12,6 +12,21 @@ const dbPath = path.join(root, "data", `api-test-${process.pid}.sqlite`);
 let child;
 let baseUrl;
 const bootstrap = "test-bootstrap-token-not-for-production";
+const agentTestProtectionKey = randomBytes(32).toString("base64");
+
+function agentProgram(packageDirectory) {
+  return process.platform === "linux"
+    ? path.join(packageDirectory, "agent-test-publish", "FamilyRmm.Agent.dll")
+    : path.join(packageDirectory, "agent-publish", "FamilyRmm.Agent.exe");
+}
+
+function runAgent(program, args, { env = {}, timeout = 30_000 } = {}) {
+  const agentEnv = { ...process.env, ...env };
+  if (process.platform === "linux") agentEnv.FAMILY_RMM_AGENT_TEST_PROTECTION_KEY = agentTestProtectionKey;
+  const command = process.platform === "linux" ? "dotnet" : program;
+  const commandArgs = process.platform === "linux" ? [program, ...args] : args;
+  return execFileSync(command, commandArgs, { cwd: path.dirname(program), env: agentEnv, encoding: "utf8", timeout });
+}
 
 async function freePort() {
   const server = createServer();
@@ -31,7 +46,7 @@ let genericPackageId;
   let genericTestStatePath;
   child = spawn(process.execPath, ["src/server/index.mjs"], {
     cwd: root,
-    env: { ...process.env, RMM_ENV: "development", RMM_HOST: "127.0.0.1", RMM_PORT: String(port), RMM_SERVER_URL: baseUrl, RMM_DB_PATH: dbPath, RMM_SETUP_TOKEN: bootstrap },
+    env: { ...process.env, RMM_ENV: "development", RMM_ENABLE_AGENT_TEST_HARNESS: "1", RMM_HOST: "127.0.0.1", RMM_PORT: String(port), RMM_SERVER_URL: baseUrl, RMM_DB_PATH: dbPath, RMM_SETUP_TOKEN: bootstrap },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
@@ -178,11 +193,11 @@ let genericPackageId;
   assert.deepEqual([...setupBytes.slice(0, 2)], [0x4d, 0x5a], "download is a Windows EXE");
   assert.ok(setupBytes.length > msiBytes.length);
   const packageDirectory = path.join(root, ".artifacts", "packages", packageId);
-  const agentExe = path.join(packageDirectory, "agent-publish", "FamilyRmm.Agent.exe");
-  const selfCheck = execFileSync(agentExe, ["--self-check"], { cwd: path.dirname(agentExe), encoding: "utf8", timeout: 30_000 });
+  const agentExe = agentProgram(packageDirectory);
+  const selfCheck = runAgent(agentExe, ["--self-check"]);
   assert.match(selfCheck, /Configuration valid/ , "built .NET agent verifies the signed authorization against the running RMM API");
   testAgentStatePath = path.join(packageDirectory, "agent-test-state");
-  const checkin = execFileSync(agentExe, ["--checkin-once"], { cwd: path.dirname(agentExe), env: { ...process.env, FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: testAgentStatePath }, encoding: "utf8", timeout: 60_000 });
+  const checkin = runAgent(agentExe, ["--checkin-once"], { env: { FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: testAgentStatePath }, timeout: 60_000 });
   const enrolledId = checkin.match(/Device ([a-f0-9]{32}) enrolled and reported hardware\/software inventory\./)?.[1];
   assert.ok(enrolledId, "the actual agent EXE enrolls and submits its initial inventory");
   const enrolledDevice = await fetch(`${baseUrl}/api/devices/${enrolledId}`, { headers: { Cookie: cookie } }).then((r) => r.json());
@@ -213,18 +228,18 @@ let genericPackageId;
   const publicPage = await fetch(stableShare.url);
   assert.equal(publicPage.status, 200);
   assert.match(await publicPage.text(), /administrator approves/i);
-  const genericAgentExe = path.join(root, ".artifacts", "packages", genericPackage.id, "agent-publish", "FamilyRmm.Agent.exe");
-  const genericSelfCheck = execFileSync(genericAgentExe, ["--self-check"], { cwd: path.dirname(genericAgentExe), encoding: "utf8", timeout: 30_000 });
+  const genericAgentExe = agentProgram(path.join(root, ".artifacts", "packages", genericPackage.id));
+  const genericSelfCheck = runAgent(genericAgentExe, ["--self-check"]);
   assert.match(genericSelfCheck, /grant expires/i, "the public installer validates its signed grant before sending a pending request");
   genericTestStatePath = path.join(root, ".artifacts", "packages", genericPackage.id, "agent-test-state");
-  const enrollmentRequest = execFileSync(genericAgentExe, ["--enrollment-request-once"], { cwd: path.dirname(genericAgentExe), env: { ...process.env, FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: genericTestStatePath }, encoding: "utf8", timeout: 30_000 });
+  const enrollmentRequest = runAgent(genericAgentExe, ["--enrollment-request-once"], { env: { FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: genericTestStatePath } });
   const pendingDeviceId = enrollmentRequest.match(/Device ([a-f0-9]{32}) requested enrollment \(pending\)/)?.[1];
   assert.ok(pendingDeviceId, "the actual generic agent asks for authorization and remains pending");
   const pendingAfterGeneric = await fetch(`${baseUrl}/api/enrollment/pending`, { headers: { Cookie: cookie } }).then((r) => r.json());
   assert.ok(pendingAfterGeneric.items.some((item) => item.id === pendingDeviceId));
   const approveGeneric = await fetch(`${baseUrl}/api/enrollment/pending/${pendingDeviceId}/approve`, { method: "POST", headers: adminHeaders });
   assert.equal(approveGeneric.status, 200);
-  const checkinAfterApproval = execFileSync(genericAgentExe, ["--checkin-once"], { cwd: path.dirname(genericAgentExe), env: { ...process.env, FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: genericTestStatePath }, encoding: "utf8", timeout: 60_000 });
+  const checkinAfterApproval = runAgent(genericAgentExe, ["--checkin-once"], { env: { FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: genericTestStatePath }, timeout: 60_000 });
   assert.match(checkinAfterApproval, new RegExp(`Device ${pendingDeviceId} enrolled`));
   const approvedGeneric = await fetch(`${baseUrl}/api/devices/${pendingDeviceId}`, { headers: { Cookie: cookie } }).then((r) => r.json());
   assert.equal(approvedGeneric.device.status, "Online");
@@ -236,12 +251,7 @@ let genericPackageId;
   const enrollmentTestDb = new DatabaseSync(dbPath);
   enrollmentTestDb.prepare("DELETE FROM devices WHERE id=?").run(pendingDeviceId);
   enrollmentTestDb.close();
-  const recoveredEnrollment = execFileSync(genericAgentExe, ["--reconcile-enrollment-once"], {
-    cwd: path.dirname(genericAgentExe),
-    env: { ...process.env, FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: genericTestStatePath },
-    encoding: "utf8",
-    timeout: 30_000,
-  });
+  const recoveredEnrollment = runAgent(genericAgentExe, ["--reconcile-enrollment-once"], { env: { FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: genericTestStatePath } });
   assert.match(recoveredEnrollment, new RegExp(`Device ${pendingDeviceId} enrollment is pending approval`));
   const recoveredPending = await fetch(`${baseUrl}/api/enrollment/pending`, { headers: { Cookie: cookie } }).then((r) => r.json());
   assert.ok(recoveredPending.items.some((item) => item.id === pendingDeviceId), "a stale enrolled identity with a missing server record reappears for approval");
@@ -326,7 +336,7 @@ let genericPackageId;
   const scriptJobResponse = await fetch(baseUrl + "/api/deployments", { method: "POST", headers: adminHeaders, body: JSON.stringify({ packageId: scriptInfo.id, deviceIds: [enrolledId, secondId], action: "script", timeoutSeconds: 60 }) });
   assert.equal(scriptJobResponse.status, 201);
   const scriptJob = await scriptJobResponse.json();
-  const deploymentRun = execFileSync(agentExe, ["--deployment-once"], { cwd: path.dirname(agentExe), env: { ...process.env, FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: testAgentStatePath }, encoding: "utf8", timeout: 60_000 });
+  const deploymentRun = runAgent(agentExe, ["--deployment-once"], { env: { FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: testAgentStatePath }, timeout: 60_000 });
   assert.match(deploymentRun, /processed one authorized deployment task/);
   const deploymentState = await fetch(baseUrl + "/api/deployments", { headers: { Cookie: cookie } }).then((r) => r.json());
   const scriptJobState = deploymentState.items.find((item) => item.id === scriptJob.id);
@@ -347,7 +357,7 @@ let genericPackageId;
   const unsignedJobResponse = await fetch(`${baseUrl}/api/deployments`, { method: "POST", headers: adminHeaders, body: JSON.stringify({ packageId: softwarePackageId, deviceIds: [enrolledId], action: "install" }) });
   assert.equal(unsignedJobResponse.status, 201);
   const unsignedJob = await unsignedJobResponse.json();
-  execFileSync(agentExe, ["--deployment-once"], { cwd: path.dirname(agentExe), env: { ...process.env, FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: testAgentStatePath }, encoding: "utf8", timeout: 60_000 });
+  runAgent(agentExe, ["--deployment-once"], { env: { FAMILY_RMM_AGENT_TEST_STATE_DIRECTORY: testAgentStatePath }, timeout: 60_000 });
   const unsignedDeploymentState = await fetch(baseUrl + "/api/deployments", { headers: { Cookie: cookie } }).then((r) => r.json());
   const unsignedTarget = unsignedDeploymentState.items.find((item) => item.id === unsignedJob.id).targets[0];
   assert.equal(unsignedTarget.state, "failed", "the agent rejects an unsigned installer before execution");

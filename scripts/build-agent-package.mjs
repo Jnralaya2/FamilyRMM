@@ -28,6 +28,7 @@ const buildConfigPath = path.join(buildRoot, "package-config.json");
 await writeFile(buildConfigPath, JSON.stringify(config, null, 2), { flag: "wx" });
 process.once("exit", () => { try { rmSync(buildRoot, { recursive: true, force: true }); } catch { /* Temporary build files only. */ } });
 const agentPublish = path.join(buildRoot, "agent-publish");
+const agentTestPublish = path.join(buildRoot, "agent-test-publish");
 const agentExe = path.join(agentPublish, "FamilyRmm.Agent.exe");
 const msiFileName = `FamilyRmmAgent-${version}.msi`;
 const setupFileName = `FamilyRmmAgentSetup-${version}.exe`;
@@ -59,11 +60,24 @@ function sign(file) {
   run(signTool, ["verify", "/pa", "/all", file], `Authenticode verification ${path.basename(file)}`);
 }
 
-const enableTestHarness = process.env.RMM_ENV !== "production";
+const enableTestHarness = process.env.RMM_ENV !== "production" && process.env.RMM_ENABLE_AGENT_TEST_HARNESS === "1";
 const publishArgs = ["publish", project, "-c", "Release", "--no-restore", "-p:AgentConfigPath=" + buildConfigPath, "-p:Version=" + version,
   "-p:EnableAgentTestHarness=" + enableTestHarness, "-p:EnableWindowsTargeting=true", "-o", agentPublish];
 run("dotnet", publishArgs, "Publishing the Windows service agent");
 sign(agentExe);
+
+// Linux API tests execute a second, framework-dependent build of the same
+// agent sources. The Windows single-file executable above remains the artifact
+// embedded in the MSI; the portable build is only a development test harness.
+if (process.platform === "linux" && enableTestHarness) {
+  const projectDirectory = path.dirname(project);
+  const projectIntermediate = path.join(projectDirectory, "obj") + path.sep;
+  const testHarnessAssets = path.join(projectDirectory, "obj", "linux-policy-self-test") + path.sep;
+  run("dotnet", ["publish", project, "-c", "Release", "--no-restore", "-p:TargetFramework=net10.0", "-p:RuntimeIdentifier=linux-x64",
+    "-p:SelfContained=false", "-p:UseAppHost=false", "-p:PublishSingleFile=false", "-p:AgentConfigPath=" + buildConfigPath,
+    "-p:EnableAgentTestHarness=true", "-p:EnableWindowsTargeting=true", "-p:BaseIntermediateOutputPath=" + projectIntermediate,
+    "-p:MSBuildProjectExtensionsPath=" + testHarnessAssets, "-o", agentTestPublish], "Publishing the Linux agent test harness");
+}
 
 if (process.platform === "win32") {
   const wix = process.env.RMM_WIX_PATH || "wix";
@@ -114,7 +128,9 @@ for (const [source, fileName] of [[msiPath, msiFileName], [setupExe, setupFileNa
   await rm(destination, { force: true });
   await rename(stagedDestination, destination);
 }
-// Keep a testable copy of the exact agent executable alongside local
-// development packages. Production artifacts expose only the installers.
+// Keep the exact Windows agent executable alongside local development
+// packages. The portable agent harness is copied only when explicitly opted
+// in and remains separate from the Windows EXE/MSI artifacts.
 if (process.env.RMM_ENV !== "production") await cp(agentPublish, path.join(output, "agent-publish"), { recursive: true });
+if (process.platform === "linux" && enableTestHarness) await cp(agentTestPublish, path.join(output, "agent-test-publish"), { recursive: true });
 process.stdout.write(JSON.stringify(buildInfo));
