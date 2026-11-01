@@ -10,7 +10,7 @@ import {
   X,
 } from "lucide-react";
 
-type AuthInfo = { setupRequired: boolean; authenticated: boolean; purchaseContact: string; administrator: { id: string; email: string; role: string; organizationId: string; workspaceName: string; deviceLimit: number | null; sessionLimit: number | null; licenseStatus: string } | null; csrfToken: string | null };
+type AuthInfo = { setupRequired: boolean; authenticated: boolean; purchaseContact: string; administrator: { id: string; email: string; role: string; organizationId: string; workspaceName: string; deviceLimit: number | null; sessionLimit: number | null; licenseStatus: string; suspended: boolean; licenseMessage: string | null } | null; csrfToken: string | null };
 type Device = { id: string; name: string; operatingSystem: string | null; osVersion: string | null; architecture: string | null; manufacturer: string | null; model: string | null; cpu: string | null; cpuCores: number | null; totalMemoryMB: number | null; ipAddresses: string[]; agentVersion: string | null; lastSeen: string | null; softwareInventoryAt?: string | null; enrolledAt: string; status: string; cpuUsagePercent?: number | null; memoryUsagePercent?: number | null };
 type Overview = { totalDevices: number; onlineDevices: number; offlineDevices: number; revokedDevices: number; lastCheckIn: string | null; performance: { hour: string; cpu: number | null; memory: number | null }[] };
 type Page = "overview" | "devices" | "deployments" | "enrollment" | "downloads" | "audit" | "licenses" | "screenconnect";
@@ -64,6 +64,7 @@ export default function App() {
 
   if (!auth) return <div className="startup"><div className="startup-mark"><Activity size={20} /></div><span>{authError || "Starting operations console"}</span><LoaderCircle className="spin" size={17} /></div>;
   if (!auth.authenticated) return <AuthScreen setupRequired={auth.setupRequired} purchaseContact={auth.purchaseContact} onSuccess={refreshAuth} />;
+  if (auth.administrator?.suspended) return <main className="startup"><section className="panel"><div className="panel-heading"><div><h1>Workspace suspended</h1><p>{auth.administrator.licenseMessage || "This workspace is suspended. Contact the FamilyRMM platform owner."}</p></div><StatusPill status="Suspended" /></div><button className="secondary-button" onClick={() => void onLogout()}><LogOut size={15} />Sign out</button></section></main>;
   const isPlatformOwner = auth.administrator?.role === "platform_owner";
   const canDeploy = ["platform_owner", "owner", "administrator"].includes(auth.administrator?.role || "");
 
@@ -150,6 +151,13 @@ function LicenseManagement({ csrfToken, onNotice }: { csrfToken: string; onNotic
     catch (e) { setError(e instanceof Error ? e.message : "License revocation failed."); }
     finally { setBusy(false); }
   };
+  const reactivate = async (id: string) => {
+    if (!window.confirm("Restore this customer's workspace access? Failed installer builds will remain failed.")) return;
+    setBusy(true); setError("");
+    try { await request(`/api/licenses/${id}/reactivate`, { method: "POST", headers: { "x-csrf-token": csrfToken } }); await load(); onNotice("License reactivated. Workspace access restored."); }
+    catch (e) { setError(e instanceof Error ? e.message : "License reactivation failed."); }
+    finally { setBusy(false); }
+  };
   const savePurchaseContact = async (event: FormEvent) => {
     event.preventDefault(); setBusy(true); setError("");
     try { const value = await request<{ purchaseContact: string }>("/api/platform-settings/purchase-contact", { method: "POST", headers: { "Content-Type": "application/json", "x-csrf-token": csrfToken }, body: JSON.stringify({ url: purchaseContact }) }); setPurchaseContact(value.purchaseContact); onNotice("Purchase contact link saved."); }
@@ -168,7 +176,7 @@ function LicenseManagement({ csrfToken, onNotice }: { csrfToken: string; onNotic
       {error && <div className="form-error"><AlertCircle size={16} />{error}</div>}
     </section>
     <section className="panel enrollment-policy-list"><div className="panel-heading"><div><h2>Issued licenses</h2><p>Available keys and activated customer workspaces.</p></div><span className="pending-count">{items.length}</span></div>
-      {items.length ? <div className="table-scroll"><table className="device-table"><thead><tr><th>ACCESS KEY</th><th>WORKSPACE</th><th>DEVICES</th><th>STATUS</th><th>CREATED</th><th /></tr></thead><tbody>{items.map((item) => <tr key={item.id}><td><strong>{item.label}</strong></td><td>{item.workspaceName || "Not redeemed"}</td><td>{item.activeDevices} · Unlimited</td><td><StatusPill status={item.status === "active" ? "Active" : item.status === "revoked" ? "Revoked" : "Available"} /></td><td>{shortDate(item.redeemedAt || item.createdAt)}</td><td>{item.status !== "revoked" && <button className="secondary-button" disabled={busy} onClick={() => void revoke(item.id)}>Revoke</button>}</td></tr>)}</tbody></table></div> : <div className="compact-empty"><strong>No access keys issued</strong><small>Generate a workspace access key.</small></div>}
+      {items.length ? <div className="table-scroll"><table className="device-table"><thead><tr><th>ACCESS KEY</th><th>WORKSPACE</th><th>DEVICES</th><th>STATUS</th><th>CREATED</th><th /></tr></thead><tbody>{items.map((item) => <tr key={item.id}><td><strong>{item.label}</strong></td><td>{item.workspaceName || "Not redeemed"}</td><td>{item.activeDevices} · Unlimited</td><td><StatusPill status={item.status === "active" ? "Active" : item.status === "revoked" ? "Revoked" : "Available"} /></td><td>{shortDate(item.redeemedAt || item.createdAt)}</td><td>{item.status === "revoked" ? item.workspaceName ? <button className="secondary-button" disabled={busy} onClick={() => void reactivate(item.id)}>Reactivate</button> : null : <button className="secondary-button" disabled={busy} onClick={() => void revoke(item.id)}>Revoke</button>}</td></tr>)}</tbody></table></div> : <div className="compact-empty"><strong>No access keys issued</strong><small>Generate a workspace access key.</small></div>}
     </section>
   </>;
 }

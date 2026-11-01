@@ -48,11 +48,18 @@ test("production dashboard builds and serves the real MSI/EXE without a separate
   });
 
   let started = false;
+  let lastReadinessError = "No health response was received.";
   for (let i = 0; i < 100; i++) {
-    try { if ((await fetch(`${baseUrl}/api/health`)).ok) { started = true; break; } } catch { /* wait for local API */ }
+    try {
+      const response = await fetch(`${baseUrl}/api/health`);
+      if (response.ok) { started = true; break; }
+      lastReadinessError = `Health endpoint returned HTTP ${response.status}.`;
+    } catch (error) {
+      lastReadinessError = String(error?.cause?.code || error?.code || error?.message || error);
+    }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  assert.ok(started, `production API did not start: ${output}`);
+  assert.ok(started, `production API did not become healthy: ${output}\nLast health probe: ${lastReadinessError}`);
 
   const origin = { Origin: baseUrl };
   const owner = await fetch(`${baseUrl}/api/auth/setup`, {

@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { getApplicationCatalog, resolveCatalogApplication, downloadCatalogInstaller } from "./deployment-catalog.mjs";
+import { finalizeInstallerBuild } from "./installer-build-lifecycle.mjs";
 
 const scrypt = promisify(scryptCallback);
 const root = path.dirname(path.dirname(path.dirname(fileURLToPath(import.meta.url))));
@@ -471,6 +472,23 @@ function startLocalInstallerBuildLoop() {
             AND (b.generic=1 OR (g.revoked_at IS NULL AND p.revoked_at IS NULL AND g.expires_at>?))
           ORDER BY b.created_at LIMIT 1`).get(staleBefore, now);
         if (!job) break;
+        if (!organizationEntitlement(job.organizationId).allowed) {
+          const message = "Workspace suspended because its license was revoked; installer build was not started.";
+          db.exec("BEGIN IMMEDIATE");
+          try {
+            const failed = db.prepare(`UPDATE installer_build_jobs SET status='failed',error=?,updated_at=?
+              WHERE id=? AND status IN ('queued','running')`).run(message, new Date().toISOString(), job.jobId);
+            if (failed.changes) {
+              db.prepare("UPDATE installer_packages SET build_status='failed',build_error=? WHERE id=? AND build_status='building'").run(message, job.installerId);
+              audit("installer.package_build_suspended", null, job.installerId, JSON.stringify({ jobId: job.jobId, reason: "workspace_suspended" }));
+            }
+            db.exec("COMMIT");
+          } catch (error) {
+            try { db.exec("ROLLBACK"); } catch { /* Transaction already closed. */ }
+            throw error;
+          }
+          continue;
+        }
         const claimed = db.prepare(`UPDATE installer_build_jobs SET status='running',claimed_at=?,updated_at=?,error=NULL
           WHERE id=? AND (status='queued' OR (status='running' AND updated_at<?))`).run(now, now, job.jobId, staleBefore);
         if (!claimed.changes) continue;
@@ -519,16 +537,27 @@ function startLocalInstallerBuildLoop() {
           });
           const buildInfo = JSON.parse(await readFile(path.join(outputDir, "build-info.json"), "utf8"));
           if (buildInfo.signingStatus !== "unsigned") throw new Error("Unexpected installer signing state.");
-          db.prepare(`UPDATE installer_packages SET build_status='ready',signing_status=?,msi_file=?,setup_file=?,msi_sha256=?,setup_sha256=?,build_error=NULL WHERE id=?`)
-            .run(buildInfo.signingStatus, buildInfo.installer.file, buildInfo.setup.file, buildInfo.installer.sha256, buildInfo.setup.sha256, job.installerId);
-          db.prepare("UPDATE installer_build_jobs SET status='ready',updated_at=?,error=NULL WHERE id=?").run(new Date().toISOString(), job.jobId);
-          audit("installer.package_created", job.createdBy, job.installerId, JSON.stringify({ grantId: job.grantId, signingStatus: buildInfo.signingStatus, generic: Boolean(job.generic), localBuild: true }));
+          const published = finalizeInstallerBuild(db, {
+            jobId: job.jobId, installerId: job.installerId, organizationId: job.organizationId, buildInfo,
+            now: new Date().toISOString(), isOrganizationEntitled: (organizationId) => organizationEntitlement(organizationId).allowed,
+            audit: () => audit("installer.package_created", job.createdBy, job.installerId, JSON.stringify({ grantId: job.grantId, signingStatus: buildInfo.signingStatus, generic: Boolean(job.generic), localBuild: true })),
+          });
+          if (!published) throw new Error("Workspace was suspended or the installer build stopped; package was not made available.");
           console.log(`Windows installer package ${job.installerId} built from agent source (${Buffer.byteLength(output)} bytes of builder output).`);
         } catch (error) {
           const message = String(error?.message || "Windows installer build failed.").slice(0, 1500);
-          db.prepare("UPDATE installer_packages SET build_status='failed',build_error=? WHERE id=?").run(message, job.installerId);
-          db.prepare("UPDATE installer_build_jobs SET status='failed',error=?,updated_at=? WHERE id=?").run(message, new Date().toISOString(), job.jobId);
-          audit("installer.package_build_failed", job.createdBy, job.installerId, JSON.stringify({ grantId: job.grantId, reason: message.slice(0, 400), localBuild: true }));
+          db.exec("BEGIN IMMEDIATE");
+          try {
+            const failed = db.prepare("UPDATE installer_build_jobs SET status='failed',error=?,updated_at=? WHERE id=? AND status='running'").run(message, new Date().toISOString(), job.jobId);
+            if (failed.changes) {
+              db.prepare("UPDATE installer_packages SET build_status='failed',build_error=? WHERE id=? AND build_status='building'").run(message, job.installerId);
+              audit("installer.package_build_failed", job.createdBy, job.installerId, JSON.stringify({ grantId: job.grantId, reason: message.slice(0, 400), localBuild: true }));
+            }
+            db.exec("COMMIT");
+          } catch (recordError) {
+            try { db.exec("ROLLBACK"); } catch { /* Transaction already closed. */ }
+            throw recordError;
+          }
           console.error(`Windows installer package ${job.installerId} failed: ${message}`);
         }
       }
@@ -543,9 +572,13 @@ function startLocalInstallerBuildLoop() {
 }
 function publicInstallerRecord(token) {
   if (typeof token !== "string") return null;
-  if (/^[a-f0-9]{32}$/i.test(token)) return db.prepare("SELECT i.*,g.expires_at,g.used_count,g.max_uses,g.revoked_at AS grant_revoked,p.revoked_at AS policy_revoked FROM installer_packages i JOIN enrollment_grants g ON g.id=i.grant_id JOIN enrollment_policies p ON p.id=g.policy_id WHERE i.id=?").get(token.toLowerCase()) || null;
+  if (/^[a-f0-9]{32}$/i.test(token)) return db.prepare(`SELECT i.*,i.organization_id AS entitlement_organization_id,g.expires_at,g.used_count,g.max_uses,g.revoked_at AS grant_revoked,
+    p.revoked_at AS policy_revoked FROM installer_packages i JOIN enrollment_grants g ON g.id=i.grant_id
+    JOIN enrollment_policies p ON p.id=g.policy_id WHERE i.id=?`).get(token.toLowerCase()) || null;
   if (!/^[A-Za-z0-9_-]{40,50}$/.test(token)) return null;
-  return db.prepare("SELECT l.id AS linkId,l.revoked_at AS linkRevoked,i.*,g.expires_at,g.used_count,g.max_uses,g.revoked_at AS grant_revoked,p.revoked_at AS policy_revoked FROM installer_download_links l JOIN installer_packages i ON i.id=l.installer_id JOIN enrollment_grants g ON g.id=i.grant_id JOIN enrollment_policies p ON p.id=g.policy_id WHERE l.token_hash=?").get(hashToken(token)) || null;
+  return db.prepare(`SELECT l.id AS linkId,l.revoked_at AS linkRevoked,i.*,i.organization_id AS entitlement_organization_id,g.expires_at,g.used_count,g.max_uses,
+    g.revoked_at AS grant_revoked,p.revoked_at AS policy_revoked FROM installer_download_links l JOIN installer_packages i ON i.id=l.installer_id
+    JOIN enrollment_grants g ON g.id=i.grant_id JOIN enrollment_policies p ON p.id=g.policy_id WHERE l.token_hash=?`).get(hashToken(token)) || null;
 }
 function publicInstallerUsable(item) {
   return Boolean(item
@@ -553,13 +586,14 @@ function publicInstallerUsable(item) {
     && /^[a-f0-9]{32}$/i.test(item.id)
     && item.build_status === "ready"
     && item.revoked_at === null
-    && (!Object.hasOwn(item, "linkRevoked") || item.linkRevoked === null));
+    && (!Object.hasOwn(item, "linkRevoked") || item.linkRevoked === null)
+    && organizationEntitlement(item.entitlement_organization_id ?? item.organization_id).allowed);
 }
 function sendPublicInstallerPage(res, token) {
   const item = publicInstallerRecord(token);
   if (!publicInstallerUsable(item)) {
     const body = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Installer unavailable</title><body><h1>Installer unavailable</h1><p>This installer is not available. Contact the Family RMM administrator.</p></body></html>";
-    res.writeHead(410, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" });
+    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" });
     res.end(body); return;
   }
   const body = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"referrer\" content=\"no-referrer\"><title>Download Family RMM Agent</title><style>body{font:16px system-ui,sans-serif;background:#f4f7f8;color:#17252a;margin:0;padding:8vh 20px}.card{max-width:620px;margin:auto;background:#fff;border:1px solid #dce5e7;border-radius:18px;padding:32px;box-shadow:0 8px 30px #132c3510}h1{margin-top:0}p,li{line-height:1.6;color:#52656b}.buttons{display:flex;gap:12px;flex-wrap:wrap;margin:24px 0}a{display:inline-block;background:#137b78;color:#fff;padding:13px 20px;border-radius:9px;text-decoration:none;font-weight:650}.note{font-size:14px}</style><main class=\"card\"><h1>Download Family RMM Agent</h1><p>This permanent download link only provides the installer. Installing creates a pending enrollment request; the computer is not manageable until the Family RMM administrator approves it.</p><div class=\"buttons\"><a href=\"/api/public-installers/" + token + "/msi\" rel=\"noreferrer\">Download MSI</a><a href=\"/api/public-installers/" + token + "/exe\" rel=\"noreferrer\">Download EXE</a></div><h2>Install and enroll</h2><ol><li>Download and run the installer, then approve the Windows administrator prompt.</li><li>The Family RMM Agent service starts automatically and submits a pending request.</li><li>The administrator reviews and approves the computer in Family RMM → Enrollment.</li></ol><p class=\"note\">The installer is unsigned and Windows may show an unknown-publisher warning. Keep SmartScreen enabled. The installer never includes an administrator password.</p></main></html>";
@@ -626,6 +660,38 @@ function currentSession(req) {
   }
   return row;
 }
+const suspendedWorkspaceError = "This workspace is suspended because its license is revoked. Contact the FamilyRMM platform owner.";
+function organizationEntitlement(organizationId) {
+  const organization = db.prepare(`SELECT o.id,o.license_id,l.id AS matched_license_id,l.organization_id AS license_organization_id,l.status AS license_status
+    FROM organizations o LEFT JOIN licenses l ON l.id=o.license_id WHERE o.id=?`).get(organizationId);
+  if (!organization) return { allowed: false, status: "unavailable", organizationId };
+  // The platform owner's default workspace is deliberately license-free. Do not
+  // extend this exception to any other organization, including platform-owner
+  // sessions scoped to a customer workspace.
+  if (organization.id === defaultOrganization.id && organization.license_id === null)
+    return { allowed: true, status: "unlicensed", organizationId, platformWorkspace: true };
+  if (!organization.license_id || !organization.matched_license_id || organization.license_organization_id !== organization.id)
+    return { allowed: false, status: "unavailable", organizationId };
+  return { allowed: organization.license_status === "active", status: organization.license_status, organizationId };
+}
+function requireOrganizationEntitlement(organizationId, res, { kind = "session", hidden = false } = {}) {
+  const entitlement = organizationEntitlement(organizationId);
+  if (entitlement.allowed) return true;
+  if (hidden) {
+    send(res, 404, { error: "Installer package not found." });
+    return false;
+  }
+  if (kind === "agent" || kind === "enrollment") {
+    send(res, 403, { error: suspendedWorkspaceError, code: "WORKSPACE_SUSPENDED" });
+    return false;
+  }
+  if (kind === "worker") {
+    send(res, 410, { error: "This installer build is no longer available.", code: "WORKSPACE_SUSPENDED" });
+    return false;
+  }
+  send(res, 423, { error: suspendedWorkspaceError, code: "WORKSPACE_SUSPENDED" });
+  return false;
+}
 function checkOrigin(req) {
   const origin = req.headers.origin;
   if (!origin) return false;
@@ -664,21 +730,23 @@ function authenticateAgentRequest(req, raw, res, allowPending = false) {
   }
   const timestampMs = Number(timestamp);
   if (!Number.isSafeInteger(timestampMs) || Math.abs(Date.now() - timestampMs) > 60_000) { send(res, 401, { error: "Agent request expired." }); return null; }
-  const device = db.prepare(`SELECT d.id,d.device_public_key,d.revoked_at,d.enrollment_state,d.organization_id,l.status AS license_status,o.license_id
+  const device = db.prepare(`SELECT d.id,d.device_public_key,d.revoked_at,d.enrollment_state,d.organization_id
     FROM devices d JOIN organizations o ON o.id=d.organization_id LEFT JOIN licenses l ON l.id=o.license_id WHERE d.id=?`).get(deviceId);
   if (!device || device.revoked_at || (!allowPending && device.enrollment_state !== "approved") || !device.device_public_key) { send(res, 403, { error: "This device is not authorized." }); return null; }
   const message = Buffer.concat([Buffer.from(`${timestamp}\n${nonce}\n`), raw]);
   let valid = false;
   try { valid = cryptoVerify("sha256", message, device.device_public_key, Buffer.from(signature, "base64url")); } catch { valid = false; }
   if (!valid) { send(res, 401, { error: "Agent signature is invalid." }); return null; }
+  if (!requireOrganizationEntitlement(device.organization_id, res, { kind: "agent" })) return null;
   try { db.prepare("INSERT INTO agent_request_nonces(device_id, nonce, used_at) VALUES(?,?,?)").run(deviceId, nonce, Date.now()); }
   catch { send(res, 409, { error: "Agent request nonce has already been used." }); return null; }
   db.prepare("DELETE FROM agent_request_nonces WHERE used_at < ?").run(Date.now() - 10 * 60_000);
   return device;
 }
-function requireAdmin(req, res) {
+function requireAdmin(req, res, { allowSuspended = false } = {}) {
   const session = currentSession(req);
   if (!session) { send(res, 401, { error: "Sign in to continue." }); return null; }
+  if (!allowSuspended && !requireOrganizationEntitlement(session.organization_id, res)) return null;
   return session;
 }
 function csrfValid(req, session) {
@@ -748,12 +816,14 @@ async function api(req, res, url) {
     const session = currentSession(req);
     const purchaseContact = db.prepare("SELECT value FROM platform_settings WHERE key='license_purchase_contact'").get()?.value || "";
     const workspace = session ? db.prepare("SELECT name FROM organizations WHERE id=?").get(session.organization_id) : null;
+    const entitlement = session ? organizationEntitlement(session.organization_id) : null;
     send(res, 200, {
       setupRequired: db.prepare("SELECT COUNT(*) AS n FROM administrators").get().n === 0,
       authenticated: Boolean(session),
       purchaseContact,
       administrator: session ? { id: session.id, email: session.email, role: session.role, organizationId: session.organization_id,
-        workspaceName: workspace?.name || "Workspace", deviceLimit: null, sessionLimit: null, licenseStatus: "active" } : null,
+        workspaceName: workspace?.name || "Workspace", deviceLimit: null, sessionLimit: null, licenseStatus: entitlement.status,
+        suspended: !entitlement.allowed, licenseMessage: entitlement.allowed ? null : suspendedWorkspaceError } : null,
       csrfToken: session?.csrf_token || null,
     });
     return;
@@ -845,6 +915,11 @@ async function api(req, res, url) {
       valid = timingSafeEqual(candidate, Buffer.from(admin.password_hash, "hex"));
     }
     if (!valid) { audit("administrator.login_failed", null, null, email.slice(0, 254)); send(res, 401, { error: "Email or password is incorrect." }); return; }
+    const entitlement = organizationEntitlement(admin.organization_id);
+    if (!entitlement.allowed) {
+      send(res, 423, { error: suspendedWorkspaceError, code: "WORKSPACE_SUSPENDED" });
+      return;
+    }
     for (const key of keys) loginAttempts.delete(key);
     const sessionToken = randomBytes(32).toString("base64url");
     const csrf = randomBytes(32).toString("base64url");
@@ -891,6 +966,10 @@ async function api(req, res, url) {
       let proofValid = false;
       try { proofValid = cryptoVerify("sha256", Buffer.from(`${deviceId}\n${timestamp}\n${nonce}`), publicKey, Buffer.from(String(body.proofSignature || ""), "base64url")); } catch { proofValid = false; }
       if (!proofValid) { send(res, 401, { error: "Device key proof is invalid." }); return; }
+      if (!requireOrganizationEntitlement(defaultOrganization.id, res, { kind: "enrollment" })) return;
+      if (process.env.RMM_ENV === "production") {
+        send(res, 403, { error: "A signed workspace enrollment grant is required.", code: "ENROLLMENT_GRANT_REQUIRED" }); return;
+      }
       const existing = db.prepare("SELECT id,organization_id,device_public_key,enrollment_state,revoked_at FROM devices WHERE id=?").get(deviceId);
       if (existing) {
         if (existing.organization_id !== defaultOrganization.id || existing.device_public_key !== publicKeyPem || existing.revoked_at || existing.enrollment_state === "rejected") {
@@ -922,6 +1001,7 @@ async function api(req, res, url) {
     const organization = manifestOrganizationId ? db.prepare("SELECT o.id,o.license_id,l.status FROM organizations o LEFT JOIN licenses l ON l.id=o.license_id WHERE o.id=?").get(manifestOrganizationId) : null;
     if (grantRow && grantRow.organization_id !== manifestOrganizationId) { send(res, 403, { error: "Enrollment grant belongs to another workspace." }); return; }
     if (!grantRow || !policy || !organization || grantRow.policy_id !== policy.id || grantRow.revoked_at || policy.revoked_at) { send(res, 403, { error: "Enrollment grant or policy is inactive." }); return; }
+    if (!requireOrganizationEntitlement(organization.id, res, { kind: "enrollment" })) return;
     if (Date.parse(grantRow.expires_at) <= Date.now() || Date.parse(manifest.expiresAt) <= Date.now()) { send(res, 410, { error: "Enrollment grant has expired." }); return; }
     if (grantRow.manifest_json !== canonicalJson(manifest) || grantRow.signature !== signature || manifest.maxUses !== grantRow.max_uses) { send(res, 403, { error: "Enrollment grant does not match the server record." }); return; }
     const deviceId = typeof body.deviceId === "string" ? body.deviceId : "";
@@ -1203,7 +1283,8 @@ async function api(req, res, url) {
     send(res, 200, { ok: true }); return;
   }
 
-  if (route.startsWith("/api/installer-build-worker/")) {
+  const installerWorkerManagementRoute = route === "/api/installer-build-worker/status" || route === "/api/installer-build-worker/pair";
+  if (route.startsWith("/api/installer-build-worker/") && !installerWorkerManagementRoute) {
     if (!authenticateInstallerBuildWorker(req)) { send(res, 401, { error: "Installer build worker is not paired." }); return; }
     if (route === "/api/installer-build-worker/claim" && req.method === "POST") {
       send(res, 410, { error: "Installer builds are handled directly by the Family RMM server." }); return;
@@ -1214,40 +1295,84 @@ async function api(req, res, url) {
           i.agent_version AS agentVersion,g.revoked_at AS grantRevoked,p.revoked_at AS policyRevoked,g.expires_at AS expiresAt,g.used_count AS usedCount,g.max_uses AS maxUses
         FROM installer_build_jobs b JOIN installer_packages i ON i.id=b.installer_id JOIN enrollment_grants g ON g.id=b.grant_id
         JOIN enrollment_policies p ON p.id=g.policy_id WHERE b.id=?`).get(upload[1]);
-      if (!job || job.status !== "running") { send(res, 404, { error: "Active installer build job not found." }); return; }
+      if (!job) { send(res, 404, { error: "Active installer build job not found." }); return; }
+      if (!organizationEntitlement(job.organizationId).allowed) { requireOrganizationEntitlement(job.organizationId, res, { kind: "worker" }); return; }
+      if (job.status !== "running") { send(res, 410, { error: "This installer build is no longer active." }); return; }
       if (!job.generic && (job.grantRevoked || job.policyRevoked || Date.parse(job.expiresAt) <= Date.now())) {
         send(res, 410, { error: "This enrollment authorization is no longer active." }); return;
       }
       let bytes;
       try { bytes = await readRawBody(req, 250 * 1024 * 1024); } catch { send(res, 413, { error: "Installer files are limited to 250 MiB each." }); return; }
+      const currentJob = db.prepare("SELECT organization_id AS organizationId,status FROM installer_build_jobs WHERE id=?").get(upload[1]);
+      if (!currentJob || currentJob.status !== "running") { send(res, 410, { error: "This installer build is no longer active.", code: "WORKSPACE_SUSPENDED" }); return; }
+      if (!requireOrganizationEntitlement(currentJob.organizationId, res, { kind: "worker" })) return;
       const extension = upload[2];
       const magicOk = extension === "msi" ? [0xd0, 0xcf, 0x11, 0xe0].every((value, index) => bytes[index] === value) : bytes[0] === 0x4d && bytes[1] === 0x5a;
       if (!magicOk || bytes.length < 4096) { send(res, 400, { error: `The uploaded ${extension.toUpperCase()} is empty or has an invalid file signature.` }); return; }
       const installerDir = path.join(artifactPath, "packages", job.installerId);
       await mkdir(installerDir, { recursive: true });
+      const beforeStore = db.prepare("SELECT organization_id AS organizationId,status FROM installer_build_jobs WHERE id=?").get(upload[1]);
+      if (!beforeStore || beforeStore.status !== "running") { send(res, 410, { error: "This installer build is no longer active.", code: "WORKSPACE_SUSPENDED" }); return; }
+      if (!requireOrganizationEntitlement(beforeStore.organizationId, res, { kind: "worker" })) return;
       const fileName = extension === "msi" ? `FamilyRmmAgent-${job.agentVersion}.msi` : `FamilyRmmAgentSetup-${job.agentVersion}.exe`;
       await writeFile(path.join(installerDir, fileName), bytes, { flag: "w", mode: 0o640 });
+      const finalJob = db.prepare("SELECT organization_id AS organizationId,status FROM installer_build_jobs WHERE id=?").get(upload[1]);
+      if (!finalJob || finalJob.status !== "running") { send(res, 410, { error: "This installer build is no longer active.", code: "WORKSPACE_SUSPENDED" }); return; }
+      if (!requireOrganizationEntitlement(finalJob.organizationId, res, { kind: "worker" })) return;
       const digest = createHash("sha256").update(bytes).digest("hex");
       const fields = extension === "msi" ? "msi_file=?,msi_sha256=?" : "setup_file=?,setup_sha256=?";
-      db.prepare(`UPDATE installer_packages SET ${fields},signing_status='unsigned' WHERE id=?`).run(fileName, digest, job.installerId);
-      const complete = db.prepare("SELECT msi_file,setup_file,msi_sha256,setup_sha256 FROM installer_packages WHERE id=?").get(job.installerId);
-      if (complete.msi_file && complete.setup_file && complete.msi_sha256 && complete.setup_sha256) {
-        db.prepare("UPDATE installer_packages SET build_status='ready' WHERE id=?").run(job.installerId);
-        db.prepare("UPDATE installer_build_jobs SET status='ready',updated_at=? WHERE id=?").run(new Date().toISOString(), job.id);
-        audit("installer.package_created", null, job.installerId, JSON.stringify({ grantId: job.grantId, signingStatus: "unsigned", uploadedByWorker: true }));
+      db.exec("BEGIN IMMEDIATE");
+      let ready = false;
+      try {
+        const commitJob = db.prepare("SELECT organization_id AS organizationId,status FROM installer_build_jobs WHERE id=?").get(upload[1]);
+        if (!commitJob || commitJob.status !== "running" || !organizationEntitlement(commitJob.organizationId).allowed) {
+          db.exec("ROLLBACK");
+          requireOrganizationEntitlement(commitJob?.organizationId || finalJob.organizationId, res, { kind: "worker" });
+          if (!res.headersSent) send(res, 410, { error: "This installer build is no longer active.", code: "WORKSPACE_SUSPENDED" });
+          return;
+        }
+        db.prepare(`UPDATE installer_packages SET ${fields},signing_status='unsigned' WHERE id=? AND build_status='building'`).run(fileName, digest, job.installerId);
+        const complete = db.prepare("SELECT msi_file,setup_file,msi_sha256,setup_sha256 FROM installer_packages WHERE id=?").get(job.installerId);
+        ready = Boolean(complete.msi_file && complete.setup_file && complete.msi_sha256 && complete.setup_sha256);
+        if (ready) {
+          db.prepare("UPDATE installer_packages SET build_status='ready' WHERE id=? AND build_status='building'").run(job.installerId);
+          const completed = db.prepare("UPDATE installer_build_jobs SET status='ready',updated_at=? WHERE id=? AND status='running'").run(new Date().toISOString(), job.id);
+          if (completed.changes !== 1) throw new Error("Installer build is no longer active.");
+          audit("installer.package_created", null, job.installerId, JSON.stringify({ grantId: job.grantId, signingStatus: "unsigned", uploadedByWorker: true }));
+        }
+        db.exec("COMMIT");
+      } catch (error) {
+        try { db.exec("ROLLBACK"); } catch { /* Transaction already closed. */ }
+        throw error;
       }
-      send(res, 200, { ok: true, format: extension, sha256: digest, bytes: bytes.length, ready: Boolean(complete.msi_file && complete.setup_file) }); return;
+      send(res, 200, { ok: true, format: extension, sha256: digest, bytes: bytes.length, ready }); return;
     }
     const failed = route.match(/^\/api\/installer-build-worker\/jobs\/([a-f0-9]{32})\/failed$/);
     if (failed && req.method === "POST") {
       let body;
       try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid build failure report." }); return; }
       const message = typeof body.error === "string" ? body.error.slice(0, 1500) : "Windows package build failed.";
-      const job = db.prepare("SELECT installer_id AS installerId FROM installer_build_jobs WHERE id=? AND status='running'").get(failed[1]);
+      const job = db.prepare("SELECT installer_id AS installerId,organization_id AS organizationId,status FROM installer_build_jobs WHERE id=?").get(failed[1]);
       if (!job) { send(res, 404, { error: "Active installer build job not found." }); return; }
+      if (!requireOrganizationEntitlement(job.organizationId, res, { kind: "worker" })) return;
+      if (job.status !== "running") { send(res, 410, { error: "This installer build is no longer active." }); return; }
       const now = new Date().toISOString();
-      db.prepare("UPDATE installer_build_jobs SET status='failed',error=?,updated_at=? WHERE id=?").run(message, now, failed[1]);
-      db.prepare("UPDATE installer_packages SET build_status='failed',build_error=? WHERE id=?").run(message, job.installerId);
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const current = db.prepare("SELECT organization_id AS organizationId,status FROM installer_build_jobs WHERE id=?").get(failed[1]);
+        if (!current || current.status !== "running" || !organizationEntitlement(current.organizationId).allowed) {
+          db.exec("ROLLBACK");
+          requireOrganizationEntitlement(current?.organizationId || job.organizationId, res, { kind: "worker" });
+          if (!res.headersSent) send(res, 410, { error: "This installer build is no longer active." });
+          return;
+        }
+        db.prepare("UPDATE installer_build_jobs SET status='failed',error=?,updated_at=? WHERE id=? AND status='running'").run(message, now, failed[1]);
+        db.prepare("UPDATE installer_packages SET build_status='failed',build_error=? WHERE id=? AND build_status='building'").run(message, job.installerId);
+        db.exec("COMMIT");
+      } catch (error) {
+        try { db.exec("ROLLBACK"); } catch { /* Transaction already closed. */ }
+        throw error;
+      }
       send(res, 200, { ok: true }); return;
     }
     send(res, 404, { error: "Installer worker route not found." }); return;
@@ -1267,6 +1392,7 @@ async function api(req, res, url) {
       const digest = createHash("sha256").update(artifact).digest("hex");
       const expectedDigest = format === "msi" ? item.msi_sha256 : item.setup_sha256;
       if (digest !== expectedDigest) { send(res, 503, { error: "Installer integrity check failed." }); return; }
+      if (!publicInstallerUsable(item)) { send(res, 404, { error: "Installer package not found." }); return; }
       audit("installer.public_downloaded", null, item.id, JSON.stringify({ format, sha256: digest }));
       res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": artifact.length, "Content-Disposition": "attachment; filename=\"" + path.basename(fileName) + "\"", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" });
       res.end(artifact);
@@ -1274,7 +1400,7 @@ async function api(req, res, url) {
     return;
   }
 
-  const session = requireAdmin(req, res);
+  const session = requireAdmin(req, res, { allowSuspended: route === "/api/auth/logout" });
   if (!session) return;
   if ((req.method === "POST" || req.method === "DELETE" || req.method === "PATCH") && !checkOrigin(req)) {
     send(res, 403, { error: "Request origin rejected." }); return;
@@ -1325,6 +1451,7 @@ async function api(req, res, url) {
   if (route === "/api/screenconnect/instances" && req.method === "POST") {
     let body;
     try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid ScreenConnect instance configuration." }); return; }
+    if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     const name = typeof body.name === "string" ? body.name.trim().slice(0, 100) : "";
     let parsed;
     try { parsed = new URL(typeof body.baseUrl === "string" ? body.baseUrl.trim() : ""); } catch { parsed = null; }
@@ -1402,11 +1529,51 @@ async function api(req, res, url) {
   }
   const revokeLicense = route.match(/^\/api\/licenses\/([a-f0-9]{32})\/revoke$/);
   if (revokeLicense && req.method === "POST" && session.role === "platform_owner") {
-    const license = db.prepare("SELECT organization_id FROM licenses WHERE id=? AND status!='revoked'").get(revokeLicense[1]);
-    if (!license) { send(res, 404, { error: "Active license not found." }); return; }
     const now = new Date().toISOString();
-    db.prepare("UPDATE licenses SET status='revoked',revoked_at=? WHERE id=?").run(now, revokeLicense[1]);
-    audit("license.revoked", session.id, revokeLicense[1]);
+    let license;
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      license = db.prepare("SELECT organization_id FROM licenses WHERE id=? AND status!='revoked'").get(revokeLicense[1]);
+      if (!license) { db.exec("ROLLBACK"); send(res, 404, { error: "Active license not found." }); return; }
+      const revoked = db.prepare("UPDATE licenses SET status='revoked',revoked_at=? WHERE id=? AND status!='revoked'").run(now, revokeLicense[1]);
+      if (revoked.changes !== 1) { db.exec("ROLLBACK"); send(res, 404, { error: "Active license not found." }); return; }
+      if (license.organization_id) {
+        const suspendedBuilds = db.prepare(`SELECT id AS jobId,installer_id AS installerId FROM installer_build_jobs
+          WHERE organization_id=? AND status IN ('queued','running')`).all(license.organization_id);
+        db.prepare(`UPDATE installer_build_jobs SET status='failed',error='Workspace suspended because its license was revoked.',updated_at=?
+          WHERE organization_id=? AND status IN ('queued','running')`).run(now, license.organization_id);
+        db.prepare(`UPDATE installer_packages SET build_status='failed',build_error='Workspace suspended because its license was revoked.'
+          WHERE organization_id=? AND build_status='building'`).run(license.organization_id);
+        for (const build of suspendedBuilds) {
+          audit("installer.package_build_suspended", session.id, build.installerId, JSON.stringify({ jobId: build.jobId, reason: "workspace_suspended" }));
+        }
+      }
+      audit("license.revoked", session.id, revokeLicense[1]);
+      db.exec("COMMIT");
+    } catch {
+      try { db.exec("ROLLBACK"); } catch { /* Transaction already closed. */ }
+      send(res, 500, { error: "License could not be revoked." }); return;
+    }
+    send(res, 200, { ok: true }); return;
+  }
+  const reactivateLicense = route.match(/^\/api\/licenses\/([a-f0-9]{32})\/reactivate$/);
+  if (reactivateLicense && req.method === "POST") {
+    if (session.role !== "platform_owner") { send(res, 403, { error: "Only the platform owner can reactivate customer licenses." }); return; }
+    const now = new Date().toISOString();
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      const license = db.prepare(`SELECT l.organization_id FROM licenses l
+        JOIN organizations o ON o.id=l.organization_id AND o.license_id=l.id
+        WHERE l.id=? AND l.status='revoked'`).get(reactivateLicense[1]);
+      if (!license) { db.exec("ROLLBACK"); send(res, 404, { error: "Revoked customer license not found." }); return; }
+      const restored = db.prepare("UPDATE licenses SET status='active',revoked_at=NULL WHERE id=? AND status='revoked'").run(reactivateLicense[1]);
+      if (restored.changes !== 1) { db.exec("ROLLBACK"); send(res, 404, { error: "Revoked customer license not found." }); return; }
+      audit("license.reactivated", session.id, reactivateLicense[1], JSON.stringify({ organizationId: license.organization_id, restoredAt: now }));
+      db.exec("COMMIT");
+    } catch {
+      try { db.exec("ROLLBACK"); } catch { /* Transaction already closed. */ }
+      send(res, 500, { error: "License could not be reactivated." }); return;
+    }
     send(res, 200, { ok: true }); return;
   }
   if ((route.startsWith("/api/enrollment/") || route.startsWith("/api/installer-packages") || route.startsWith("/api/devices/") || route.startsWith("/api/deployment")) && !hasManagementRights) {
@@ -1421,6 +1588,7 @@ async function api(req, res, url) {
   if (catalogDeploy && req.method === "POST") {
     let body;
     try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid catalog deployment request." }); return; }
+    if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     const deviceIds = Array.isArray(body.deviceIds) ? [...new Set(body.deviceIds)] : [];
     if (deviceIds.length < 1 || deviceIds.length > 500 || deviceIds.some((id) => typeof id !== "string" || !/^[A-Fa-f0-9-]{16,64}$/.test(id))) {
       send(res, 400, { error: "Choose 1–500 valid target computers." }); return;
@@ -1437,33 +1605,45 @@ async function api(req, res, url) {
     }
     try { application = await resolveCatalogApplication(catalogDeploy[1]); }
     catch (error) { send(res, 502, { error: `Could not resolve the current vendor package: ${String(error.message || "Catalog unavailable.").slice(0, 250)}` }); return; }
+    if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     let pkg = db.prepare(`SELECT id FROM software_packages WHERE organization_id=? AND catalog_app_id=? AND version=? AND sha256=? AND revoked_at IS NULL`).get(session.organization_id, application.id, application.version, application.expectedSha256);
     if (!pkg) {
       let downloaded;
       try { downloaded = await downloadCatalogInstaller(application); }
       catch (error) { send(res, 502, { error: `Vendor package validation failed: ${String(error.message || "Download failed.").slice(0, 250)}` }); return; }
+      if (!requireOrganizationEntitlement(session.organization_id, res)) return;
       const id = randomBytes(16).toString("hex");
       const createdAt = new Date().toISOString();
       const fileName = `${id}.${application.packageType}`;
       const folder = path.join(artifactPath, "software-packages", id);
       let createdArtifact = false;
       try {
-        db.exec("BEGIN IMMEDIATE");
         pkg = db.prepare(`SELECT id FROM software_packages WHERE organization_id=? AND catalog_app_id=? AND version=? AND sha256=? AND revoked_at IS NULL`).get(session.organization_id, application.id, application.version, downloaded.sha256);
         if (!pkg) {
           await mkdir(folder, { recursive: true });
+          if (!requireOrganizationEntitlement(session.organization_id, res)) { await rm(folder, { recursive: true, force: true }); return; }
           await writeFile(path.join(folder, fileName), downloaded.bytes, { flag: "wx", mode: 0o640 });
           createdArtifact = true;
+          if (!requireOrganizationEntitlement(session.organization_id, res)) { await rm(folder, { recursive: true, force: true }); return; }
+          db.exec("BEGIN IMMEDIATE");
+          if (!organizationEntitlement(session.organization_id).allowed) throw Object.assign(new Error("Workspace suspended."), { workspaceSuspended: true });
+          pkg = db.prepare(`SELECT id FROM software_packages WHERE organization_id=? AND catalog_app_id=? AND version=? AND sha256=? AND revoked_at IS NULL`).get(session.organization_id, application.id, application.version, downloaded.sha256);
+          if (pkg) {
+            db.exec("COMMIT");
+            await rm(folder, { recursive: true, force: true });
+          } else {
           db.prepare(`INSERT INTO software_packages(id,name,version,publisher,package_type,file_name,file_size,sha256,install_arguments_json,created_by,created_at,organization_id,catalog_app_id)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, application.name, application.version, application.publisher, application.packageType, fileName,
             downloaded.bytes.length, downloaded.sha256, JSON.stringify(application.installArguments), session.id, createdAt, session.organization_id, application.id);
           pkg = { id };
           audit("deployment.catalog_package_cached", session.id, id, JSON.stringify({ catalogAppId: application.id, version: application.version, sha256: downloaded.sha256 }));
+          db.exec("COMMIT");
+          }
         }
-        db.exec("COMMIT");
-      } catch {
+      } catch (error) {
         try { db.exec("ROLLBACK"); } catch { /* The transaction may already be closed. */ }
         if (createdArtifact) try { await rm(path.join(folder, fileName), { force: true }); } catch { /* Remove only this incomplete artifact. */ }
+        if (error?.workspaceSuspended) { send(res, 423, { error: suspendedWorkspaceError, code: "WORKSPACE_SUSPENDED" }); return; }
         send(res, 500, { error: "Validated vendor package could not be stored." }); return;
       }
     }
@@ -1472,6 +1652,7 @@ async function api(req, res, url) {
     const scheduledForIso = scheduledFor.toISOString();
     try {
       db.exec("BEGIN IMMEDIATE");
+      if (!organizationEntitlement(session.organization_id).allowed) { db.exec("ROLLBACK"); send(res, 423, { error: suspendedWorkspaceError, code: "WORKSPACE_SUSPENDED" }); return; }
       db.prepare("INSERT INTO deployment_jobs(id,package_id,action,timeout_seconds,created_by,created_at,scheduled_for,organization_id) VALUES(?,?,'install',1800,?,?,?,?)")
         .run(jobId, pkg.id, session.id, now, scheduledForIso, session.organization_id);
       const insertTarget = db.prepare("INSERT INTO deployment_targets(job_id,device_id,state,assigned_at) VALUES(?,?,'queued',?)");
@@ -1510,6 +1691,7 @@ async function api(req, res, url) {
     }
     let bytes;
     try { bytes = await readRawBody(req, 250 * 1024 * 1024); } catch { send(res, 413, { error: "Software installers are limited to 250 MiB." }); return; }
+    if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     if (!bytes.length) { send(res, 400, { error: "Choose a non-empty installer package." }); return; }
     const expectedMagic = packageType === "msi" ? [0xd0,0xcf,0x11,0xe0] : [0x4d,0x5a];
     if (!expectedMagic.every((value, index) => bytes[index] === value)) { send(res, 400, { error: `The selected file is not a valid ${packageType.toUpperCase()} container.` }); return; }
@@ -1518,7 +1700,9 @@ async function api(req, res, url) {
     const folder = path.join(artifactPath, "software-packages", id);
     try {
       await mkdir(folder, { recursive: true });
+      if (!requireOrganizationEntitlement(session.organization_id, res)) { await rm(folder, { recursive: true, force: true }); return; }
       await writeFile(path.join(folder, fileName), bytes, { flag: "wx" });
+      if (!requireOrganizationEntitlement(session.organization_id, res)) { await rm(folder, { recursive: true, force: true }); return; }
       const sha256 = createHash("sha256").update(bytes).digest("hex");
       const createdAt = new Date().toISOString();
       db.prepare(`INSERT INTO software_packages(id,name,version,publisher,package_type,file_name,file_size,sha256,install_arguments_json,created_by,created_at,organization_id)
@@ -1533,6 +1717,7 @@ async function api(req, res, url) {
   if (route === "/api/deployment/scripts" && req.method === "POST") {
     let body;
     try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid script request." }); return; }
+    if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     const name = typeof body.name === "string" ? body.name.trim() : "";
     const version = typeof body.version === "string" ? body.version.trim() : "1";
     const scriptBody = typeof body.script === "string" ? body.script : "";
@@ -1567,6 +1752,7 @@ async function api(req, res, url) {
   if (route === "/api/deployments" && req.method === "POST") {
     let body;
     try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid deployment request." }); return; }
+    if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     const packageId = typeof body.packageId === "string" ? body.packageId : "";
     const deviceIds = Array.isArray(body.deviceIds) ? [...new Set(body.deviceIds)] : [];
     const action = body.action === "update" ? "update" : body.action === "script" ? "script" : "install";
@@ -1596,6 +1782,7 @@ async function api(req, res, url) {
     const scheduledForIso = scheduledFor.toISOString();
     try {
       db.exec("BEGIN IMMEDIATE");
+      if (!organizationEntitlement(session.organization_id).allowed) { db.exec("ROLLBACK"); send(res, 423, { error: suspendedWorkspaceError, code: "WORKSPACE_SUSPENDED" }); return; }
       db.prepare("INSERT INTO deployment_jobs(id,package_id,action,timeout_seconds,created_by,created_at,scheduled_for,organization_id) VALUES(?,?,?,?,?,?,?,?)").run(jobId, packageId, action, timeoutSeconds, session.id, now, scheduledForIso, session.organization_id);
       const insertTarget = db.prepare("INSERT INTO deployment_targets(job_id,device_id,state,assigned_at) VALUES(?,?,'queued',?)");
       for (const id of deviceIds) insertTarget.run(jobId, id, now);
@@ -1612,6 +1799,7 @@ async function api(req, res, url) {
   if (retryDeployment && req.method === "POST") {
     let body;
     try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid deployment retry request." }); return; }
+    if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     const source = db.prepare(`SELECT j.id,j.package_id AS packageId,j.action,j.timeout_seconds AS timeoutSeconds,p.revoked_at AS packageRevoked
       FROM deployment_jobs j JOIN software_packages p ON p.id=j.package_id WHERE j.id=? AND j.organization_id=?`).get(retryDeployment[1], session.organization_id);
     if (!source) { send(res, 404, { error: "Deployment job not found." }); return; }
@@ -1628,6 +1816,7 @@ async function api(req, res, url) {
     const id = randomBytes(16).toString("hex"), now = new Date().toISOString();
     try {
       db.exec("BEGIN IMMEDIATE");
+      if (!organizationEntitlement(session.organization_id).allowed) { db.exec("ROLLBACK"); send(res, 423, { error: suspendedWorkspaceError, code: "WORKSPACE_SUSPENDED" }); return; }
       db.prepare("INSERT INTO deployment_jobs(id,package_id,action,timeout_seconds,created_by,created_at,scheduled_for,organization_id,retry_of_job_id) VALUES(?,?,?,?,?,?,?,?,?)")
         .run(id, source.packageId, source.action, source.timeoutSeconds, session.id, now, now, session.organization_id, source.id);
       const insertTarget = db.prepare("INSERT INTO deployment_targets(job_id,device_id,state,assigned_at) VALUES(?,?,'queued',?)");
@@ -1673,6 +1862,7 @@ async function api(req, res, url) {
   if (route === "/api/enrollment/policies" && req.method === "POST") {
     let body;
     try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid policy request." }); return; }
+    if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     const name = typeof body.name === "string" ? body.name.trim() : "";
     const expiresInHours = Number(body.expiresInHours);
     const approvalMode = body.approvalMode === "approval" ? "approval" : body.approvalMode === "automatic" ? "automatic" : "";
@@ -1707,6 +1897,7 @@ async function api(req, res, url) {
   if (issueGrant && req.method === "POST") {
     let body;
     try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid grant request." }); return; }
+    if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     let issued;
     try {
       db.exec("BEGIN IMMEDIATE");
@@ -1799,12 +1990,13 @@ async function api(req, res, url) {
       return { ...item, msiSizeBytes: msi, exeSizeBytes: exe,
         status: item.buildStatus, downloads: { page: `/install/${item.id}`, msi: `/api/public-installers/${item.id}/msi`, exe: `/api/public-installers/${item.id}/exe` } };
     }));
+    if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     send(res, 200, { items: withSizes });
     return;
   }
   const shareInstaller = route.match(/^\/api\/installer-packages\/([a-f0-9]{32})\/share$/);
   if (shareInstaller && req.method === "POST") {
-    const item = db.prepare("SELECT id,build_status,revoked_at FROM installer_packages WHERE id=? AND organization_id=?").get(shareInstaller[1], session.organization_id);
+    const item = db.prepare("SELECT id,organization_id AS entitlement_organization_id,build_status,revoked_at FROM installer_packages WHERE id=? AND organization_id=?").get(shareInstaller[1], session.organization_id);
     if (!publicInstallerUsable(item)) { send(res, 409, { error: "Build the Windows installer first." }); return; }
     audit("installer.share_link_copied", session.id, item.id);
     send(res, 200, { url: serverUrl + "/install/" + item.id, downloads: { msi: `/api/public-installers/${item.id}/msi`, exe: `/api/public-installers/${item.id}/exe` } });
@@ -1813,6 +2005,7 @@ async function api(req, res, url) {
   if (route === "/api/installer-packages" && req.method === "POST") {
     let body;
     try { body = await readBody(req); } catch { send(res, 400, { error: "Invalid installer request." }); return; }
+    if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     const generic = body.generic === true;
     const grantId = generic ? ensureWorkspaceInstallerGrant(session).grant.id : typeof body.grantId === "string" ? body.grantId : "";
     if (!/^[a-f0-9]{32}$/.test(grantId)) { send(res, 400, { error: "A valid installer configuration is required." }); return; }
@@ -1827,6 +2020,7 @@ async function api(req, res, url) {
     const outputDir = path.join(artifactPath, "packages", id);
     const configPath = path.join(outputDir, "package-config.json");
     await mkdir(outputDir, { recursive: true });
+    if (!requireOrganizationEntitlement(session.organization_id, res)) { await rm(outputDir, { recursive: true, force: true }); return; }
     // Generic downloads still need a signed, workspace-scoped authorization.
     // The grant only permits a pending enrollment request; administrator
     // approval is still required before the agent can check in or run jobs.
@@ -1840,6 +2034,7 @@ async function api(req, res, url) {
       enrollmentGrant: { manifest: JSON.parse(grant.manifest_json), signature: grant.signature },
     };
     await writeFile(configPath, JSON.stringify(packageConfig, null, 2), { flag: "wx" });
+    if (!requireOrganizationEntitlement(session.organization_id, res)) { await rm(outputDir, { recursive: true, force: true }); return; }
     db.prepare(`INSERT INTO installer_packages(id,grant_id,agent_version,build_status,created_by,created_at,organization_id,generic) VALUES(?,?,?,'building',?,?,?,?)`)
       .run(id, grantId, agentVersion, session.id, createdAt, session.organization_id, generic ? 1 : 0);
     if (process.env.RMM_ENV === "production") {
@@ -1858,16 +2053,31 @@ async function api(req, res, url) {
         encoding: "utf8", windowsHide: true, timeout: 10 * 60_000, maxBuffer: 4 * 1024 * 1024,
       });
       const buildInfo = JSON.parse(await readFile(path.join(outputDir, "build-info.json"), "utf8"));
-      db.prepare(`UPDATE installer_packages SET build_status='ready',signing_status=?,msi_file=?,setup_file=?,msi_sha256=?,setup_sha256=? WHERE id=?`)
-        .run(buildInfo.signingStatus, buildInfo.installer.file, buildInfo.setup.file, buildInfo.installer.sha256, buildInfo.setup.sha256, id);
-      audit("installer.package_created", session.id, id, JSON.stringify({ grantId, agentVersion, signingStatus: buildInfo.signingStatus }));
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        if (!organizationEntitlement(session.organization_id).allowed) {
+          db.exec("ROLLBACK");
+          await rm(outputDir, { recursive: true, force: true });
+          send(res, 423, { error: suspendedWorkspaceError, code: "WORKSPACE_SUSPENDED" });
+          return;
+        }
+        const published = db.prepare(`UPDATE installer_packages SET build_status='ready',signing_status=?,msi_file=?,setup_file=?,msi_sha256=?,setup_sha256=?
+          WHERE id=? AND organization_id=? AND build_status='building'`)
+          .run(buildInfo.signingStatus, buildInfo.installer.file, buildInfo.setup.file, buildInfo.installer.sha256, buildInfo.setup.sha256, id, session.organization_id);
+        if (published.changes !== 1) throw new Error("Installer package is no longer building.");
+        audit("installer.package_created", session.id, id, JSON.stringify({ grantId, agentVersion, signingStatus: buildInfo.signingStatus }));
+        db.exec("COMMIT");
+      } catch (error) {
+        try { db.exec("ROLLBACK"); } catch { /* Transaction already closed. */ }
+        throw error;
+      }
       send(res, 201, { id, grantId, agentVersion, status: "ready", signingStatus: buildInfo.signingStatus, createdAt, generic,
         msiSha256: buildInfo.installer.sha256, setupSha256: buildInfo.setup.sha256,
         downloads: { msi: `/api/installer-packages/${id}/msi`, exe: `/api/installer-packages/${id}/exe` } });
     } catch (error) {
       const message = String(error?.message || "Installer build failed.").slice(0, 1500);
-      db.prepare("UPDATE installer_packages SET build_status='failed',build_error=? WHERE id=?").run(message, id);
-      audit("installer.package_build_failed", session.id, id, JSON.stringify({ grantId, reason: message.slice(0, 400) }));
+      const failed = db.prepare("UPDATE installer_packages SET build_status='failed',build_error=? WHERE id=? AND build_status='building'").run(message, id);
+      if (failed.changes) audit("installer.package_build_failed", session.id, id, JSON.stringify({ grantId, reason: message.slice(0, 400) }));
       send(res, 500, { error: "Windows installer build failed. Review the package status and server build log." });
     }
     return;
@@ -1886,6 +2096,7 @@ async function api(req, res, url) {
       const digest = createHash("sha256").update(artifact).digest("hex");
       const expectedDigest = packageDownload[2] === "msi" ? item.msi_sha256 : item.setup_sha256;
       if (digest !== expectedDigest) { send(res, 503, { error: "Installer integrity check failed." }); return; }
+      if (!requireOrganizationEntitlement(session.organization_id, res)) return;
       audit("installer.package_downloaded", session.id, item.id, JSON.stringify({ format: packageDownload[2], sha256: digest }));
       res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": artifact.length, "Content-Disposition": `attachment; filename="${path.basename(fileName)}"`, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
       res.end(artifact);

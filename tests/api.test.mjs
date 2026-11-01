@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { createServer } from "node:net";
-import { rm } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { generateKeyPairSync, randomBytes, sign } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
 const root = process.cwd();
@@ -36,12 +37,29 @@ async function freePort() {
   return port;
 }
 
+async function startPausedInstallerUpload(url, headers, firstChunk) {
+  let responseResolve;
+  let responseReject;
+  const response = new Promise((resolve, reject) => { responseResolve = resolve; responseReject = reject; });
+  const request = httpRequest(url, { method: "PUT", headers });
+  request.on("response", (res) => {
+    const chunks = [];
+    res.on("data", (chunk) => chunks.push(chunk));
+    res.on("end", () => responseResolve({ status: res.statusCode, body: Buffer.concat(chunks).toString("utf8") }));
+  });
+  request.on("error", responseReject);
+  await new Promise((resolve, reject) => request.write(firstChunk, (error) => error ? reject(error) : resolve()));
+  return { response, finish: (remainingBytes) => request.end(remainingBytes) };
+}
+
 test("authenticated dashboard API owner setup, reads, CSRF, logout and login", async (t) => {
   const port = await freePort();
   baseUrl = `http://127.0.0.1:${port}`;
   let packageId;
 let genericPackageId;
   let softwarePackageId;
+  let suspendedInstallerId;
+  let interruptedInstallerId;
   let testAgentStatePath;
   let genericTestStatePath;
   child = spawn(process.execPath, ["src/server/index.mjs"], {
@@ -61,16 +79,25 @@ let genericPackageId;
     for (const suffix of ["", "-shm", "-wal"]) await rm(dbPath + suffix, { force: true });
     if (packageId) await rm(path.join(root, ".artifacts", "packages", packageId), { recursive: true, force: true });
     if (genericPackageId) await rm(path.join(root, ".artifacts", "packages", genericPackageId), { recursive: true, force: true });
+    if (suspendedInstallerId) await rm(path.join(root, ".artifacts", "packages", suspendedInstallerId), { recursive: true, force: true });
+    if (interruptedInstallerId) await rm(path.join(root, ".artifacts", "packages", interruptedInstallerId), { recursive: true, force: true });
     if (softwarePackageId) await rm(path.join(root, ".artifacts", "software-packages", softwarePackageId), { recursive: true, force: true });
     if (testAgentStatePath) await rm(testAgentStatePath, { recursive: true, force: true });
   });
 
   let ready = false;
+  let lastReadinessError = "No health response was received.";
   for (let i = 0; i < 100; i++) {
-    try { if ((await fetch(`${baseUrl}/api/health`)).ok) { ready = true; break; } } catch { /* Wait for the API listener. */ }
+    try {
+      const response = await fetch(`${baseUrl}/api/health`);
+      if (response.ok) { ready = true; break; }
+      lastReadinessError = `Health endpoint returned HTTP ${response.status}.`;
+    } catch (error) {
+      lastReadinessError = String(error?.cause?.code || error?.code || error?.message || error);
+    }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  assert.ok(ready, `API did not start: ${output}`);
+  assert.ok(ready, `API did not become healthy: ${output}\nLast health probe: ${lastReadinessError}`);
 
   const status = await fetch(`${baseUrl}/api/auth/status`).then((r) => r.json());
   assert.equal(status.setupRequired, true);
@@ -216,12 +243,12 @@ let genericPackageId;
   assert.equal((await fetch(stableShare.url)).status, 200, "a ready, non-revoked installer has a public landing page");
   const nonexistentInstallerId = "f".repeat(32);
   assert.equal((await fetch(`${baseUrl}/api/public-installers/${nonexistentInstallerId}/msi`)).status, 404, "a nonexistent package cannot be downloaded");
-  assert.equal((await fetch(`${baseUrl}/install/${nonexistentInstallerId}`)).status, 410, "a nonexistent package has no public download page");
+  assert.equal((await fetch(`${baseUrl}/install/${nonexistentInstallerId}`)).status, 404, "a nonexistent package has no public download page");
   const installerStateDb = new DatabaseSync(dbPath);
   installerStateDb.prepare("UPDATE installer_packages SET build_status='building' WHERE id=?").run(genericPackage.id);
   installerStateDb.close();
   assert.equal((await fetch(`${baseUrl}/api/public-installers/${genericPackage.id}/exe`)).status, 404, "a package that is not ready cannot be downloaded");
-  assert.equal((await fetch(`${baseUrl}/install/${genericPackage.id}`)).status, 410, "a package that is not ready has no public download page");
+  assert.equal((await fetch(`${baseUrl}/install/${genericPackage.id}`)).status, 404, "a package that is not ready has no public download page");
   const readyInstallerDb = new DatabaseSync(dbPath);
   readyInstallerDb.prepare("UPDATE installer_packages SET build_status='ready' WHERE id=?").run(genericPackage.id);
   readyInstallerDb.close();
@@ -384,7 +411,7 @@ let genericPackageId;
   const packageRevoke = await fetch(`${baseUrl}/api/installer-packages/${packageId}/revoke`, { method: "POST", headers: adminHeaders });
   assert.equal(packageRevoke.status, 200);
   assert.equal((await fetch(`${baseUrl}/api/public-installers/${packageId}/msi`)).status, 404, "revoking a package blocks its existing permanent public link immediately");
-  assert.equal((await fetch(`${baseUrl}/install/${packageId}`)).status, 410, "revoking a package blocks its public landing page immediately");
+  assert.equal((await fetch(`${baseUrl}/install/${packageId}`)).status, 404, "revoking a package hides its public landing page immediately");
   assert.equal((await fetch(`${baseUrl}${packageInfo.downloads.msi}`, { headers: { Cookie: cookie } })).status, 404, "revoked installer packages are also unavailable through the authenticated download route");
   const installerRevokeAudit = await fetch(`${baseUrl}/api/audit`, { headers: { Cookie: cookie } }).then((r) => r.json());
   assert.ok(installerRevokeAudit.items.some((event) => event.action === "installer.package_revoked" && event.targetId === packageId && event.actor === "owner@example.test"), "the administrator package-revoke action remains audited");
@@ -405,6 +432,8 @@ let genericPackageId;
   assert.equal(unsafePurchaseContact.status, 400, "purchase links reject unsafe schemes");
   const licenseA = await issueLicense("Customer A", 1, 1);
   const licenseB = await issueLicense("Customer B", "unlimited");
+  const activeLicenseReactivation = await fetch(`${baseUrl}/api/licenses/${licenseB.id}/reactivate`, { method: "POST", headers: adminHeaders });
+  assert.equal(activeLicenseReactivation.status, 404, "only a revoked customer license can be reactivated");
   assert.match(licenseA.key, /^FRMM-[A-F0-9]{36}$/);
   const registerCustomer = async (email, workspace, key) => fetch(`${baseUrl}/api/auth/register`, {
     method: "POST", headers: { ...origin, "Content-Type": "application/json" },
@@ -536,15 +565,168 @@ let genericPackageId;
   const customerBPackageData = await fetch(`${baseUrl}/api/deployment/packages`, { headers: { Cookie: customerBCookie } }).then((r) => r.json());
   assert.equal(customerBPackageData.items.length, 3, "customer B sees only its MSI, EXE and PowerShell packages");
 
+  // Keep a real public installer record and active build job for B so revocation
+  // exercises both public access and the in-flight worker completion boundary.
+  suspendedInstallerId = "b".repeat(32);
+  interruptedInstallerId = "8".repeat(32);
+  const suspendedJobIds = ["c", "d"].map((letter) => letter.repeat(32));
+  const queuedBuildId = "e".repeat(32);
+  const interruptedBuildJobId = "7".repeat(32);
+  const suspendedDownloadToken = randomBytes(32).toString("base64url");
+  const db = new DatabaseSync(dbPath);
+  const customerBOrganizationId = db.prepare("SELECT id FROM organizations WHERE license_id=?").get(licenseB.id).id;
+  const publicInstallerFiles = { msi: "SuspensionTest.msi", exe: "SuspensionTest.exe" };
+  const installerMsi = Buffer.concat([Buffer.from([0xd0, 0xcf, 0x11, 0xe0]), Buffer.alloc(4092, 1)]);
+  const installerExe = Buffer.concat([Buffer.from([0x4d, 0x5a]), Buffer.alloc(4094, 2)]);
+  const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+  await mkdir(path.join(root, ".artifacts", "packages", suspendedInstallerId), { recursive: true });
+  await writeFile(path.join(root, ".artifacts", "packages", suspendedInstallerId, publicInstallerFiles.msi), installerMsi);
+  await writeFile(path.join(root, ".artifacts", "packages", suspendedInstallerId, publicInstallerFiles.exe), installerExe);
+  db.prepare(`INSERT INTO installer_packages(id,grant_id,agent_version,build_status,signing_status,msi_file,setup_file,msi_sha256,setup_sha256,created_by,created_at,organization_id,generic)
+    VALUES(?,?,?,'ready','unsigned',?,?,?,?,?,?,?,0)`).run(suspendedInstallerId, customerBGrant.manifest.grantId, "0.2.4", publicInstallerFiles.msi, publicInstallerFiles.exe, sha256(installerMsi), sha256(installerExe), customerB.administrator.id, new Date().toISOString(), customerBOrganizationId);
+  db.prepare("INSERT INTO installer_packages(id,grant_id,agent_version,build_status,created_by,created_at,organization_id,generic) VALUES(?,?,?,'building',?,?,?,0)")
+    .run("f".repeat(32), customerBGrant.manifest.grantId, "0.2.4", customerB.administrator.id, new Date().toISOString(), customerBOrganizationId);
+  db.prepare("INSERT INTO installer_packages(id,grant_id,agent_version,build_status,created_by,created_at,organization_id,generic) VALUES(?,?,?,'building',?,?,?,0)")
+    .run(interruptedInstallerId, customerBGrant.manifest.grantId, "0.2.4", customerB.administrator.id, new Date().toISOString(), customerBOrganizationId);
+  db.prepare("INSERT INTO installer_download_links(id,installer_id,token_hash,created_by,created_at) VALUES(?,?,?,?,?)")
+    .run("6".repeat(32), suspendedInstallerId, createHash("sha256").update(suspendedDownloadToken).digest("hex"), customerB.administrator.id, new Date().toISOString());
+  for (const [index, id] of suspendedJobIds.entries()) db.prepare(`INSERT INTO installer_build_jobs(id,installer_id,grant_id,organization_id,status,created_at,updated_at,generic)
+    VALUES(?,?,?,?,?,?,?,0)`).run(id, "f".repeat(32), customerBGrant.manifest.grantId, customerBOrganizationId, index === 0 ? "queued" : "running", new Date().toISOString(), new Date().toISOString());
+  db.prepare(`INSERT INTO installer_build_jobs(id,installer_id,grant_id,organization_id,status,created_at,updated_at,generic)
+    VALUES(?,?,?,?, 'running',?,?,0)`).run(queuedBuildId, suspendedInstallerId, customerBGrant.manifest.grantId, customerBOrganizationId, new Date().toISOString(), new Date().toISOString());
+  db.prepare(`INSERT INTO installer_build_jobs(id,installer_id,grant_id,organization_id,status,created_at,updated_at,generic)
+    VALUES(?,?,?,?, 'running',?,?,0)`).run(interruptedBuildJobId, interruptedInstallerId, customerBGrant.manifest.grantId, customerBOrganizationId, new Date().toISOString(), new Date().toISOString());
+  db.close();
+  const customerBPublicPage = await fetch(`${baseUrl}/install/${suspendedInstallerId}`);
+  assert.equal(customerBPublicPage.status, 200, "active customer's existing public installer page works before revocation");
+  const customerBPublicDownload = await fetch(`${baseUrl}/api/public-installers/${suspendedInstallerId}/msi`);
+  assert.equal(customerBPublicDownload.status, 200, "active customer's existing public installer download works before revocation");
+  assert.equal((await fetch(`${baseUrl}/install/${suspendedDownloadToken}`)).status, 200, "active customer's previously issued token link works before revocation");
+  assert.equal((await fetch(`${baseUrl}/api/public-installers/${suspendedDownloadToken}/msi`)).status, 200, "active customer's token-based installer download works before revocation");
+
+  const ownerWorkerPairResponse = await fetch(`${baseUrl}/api/installer-build-worker/pair`, { method: "POST", headers: adminHeaders, body: "{}" });
+  assert.equal(ownerWorkerPairResponse.status, 201);
+  const ownerWorkerToken = (await ownerWorkerPairResponse.json()).config.workerToken;
+  const workerHeaders = { Authorization: `Bearer ${ownerWorkerToken}`, "Content-Type": "application/json" };
+  const activeUploadJobDb = new DatabaseSync(dbPath);
+  activeUploadJobDb.prepare("UPDATE installer_build_jobs SET status='running' WHERE id=? AND status='queued'").run(interruptedBuildJobId);
+  assert.equal(activeUploadJobDb.prepare("SELECT status FROM installer_build_jobs WHERE id=?").get(interruptedBuildJobId).status, "running", "the test upload starts from an active worker job");
+  activeUploadJobDb.close();
+  const retainedCountsBefore = new DatabaseSync(dbPath);
+  const deviceCountBeforeRevocation = retainedCountsBefore.prepare("SELECT COUNT(*) AS n FROM devices WHERE organization_id=?").get(customerBOrganizationId).n;
+  const inventoryCountBeforeRevocation = retainedCountsBefore.prepare("SELECT COUNT(*) AS n FROM software_inventory s JOIN devices d ON d.id=s.device_id WHERE d.organization_id=?").get(customerBOrganizationId).n;
+  const deploymentCountBeforeRevocation = retainedCountsBefore.prepare("SELECT COUNT(*) AS n FROM deployment_jobs WHERE organization_id=?").get(customerBOrganizationId).n;
+  retainedCountsBefore.close();
+
+  const interruptedUploadBytes = Buffer.concat([installerMsi, Buffer.alloc(2 * 1024 * 1024 - installerMsi.length, 3)]);
+  const interruptedUpload = await startPausedInstallerUpload(`${baseUrl}/api/installer-build-worker/jobs/${interruptedBuildJobId}/msi`,
+    { ...workerHeaders, "Content-Type": "application/octet-stream" }, interruptedUploadBytes.subarray(0, 1024 * 1024));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
   const revokeCustomerLicense = await fetch(`${baseUrl}/api/licenses/${licenseB.id}/revoke`, { method: "POST", headers: adminHeaders });
   assert.equal(revokeCustomerLicense.status, 200);
-  assert.equal((await fetch(`${baseUrl}/api/overview`, { headers: { Cookie: customerBCookie } })).status, 200, "legacy license records do not revoke workspace access");
+  interruptedUpload.finish(interruptedUploadBytes.subarray(1024 * 1024));
+  const interruptedUploadResult = await interruptedUpload.response;
+  assert.equal(interruptedUploadResult.status, 410, `interrupted upload is rejected after revocation: ${interruptedUploadResult.body}`);
+  assert.equal(JSON.parse(interruptedUploadResult.body).code, "WORKSPACE_SUSPENDED");
+  const suspendedOverview = await fetch(`${baseUrl}/api/overview`, { headers: { Cookie: customerBCookie } });
+  assert.equal(suspendedOverview.status, 423, "existing sessions are immediately suspended");
+  assert.equal((await suspendedOverview.json()).code, "WORKSPACE_SUSPENDED");
+  const suspendedStatus = await fetch(`${baseUrl}/api/auth/status`, { headers: { Cookie: customerBCookie } }).then((r) => r.json());
+  assert.equal(suspendedStatus.administrator.licenseStatus, "revoked");
+  assert.equal(suspendedStatus.administrator.suspended, true);
+  const suspendedLogin = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { ...origin, "Content-Type": "application/json" }, body: JSON.stringify({ email: "b@example.test", password: "customer-password-long-enough" }) });
+  assert.equal(suspendedLogin.status, 423, "valid password cannot obtain a new session after revocation");
+  assert.equal((await suspendedLogin.json()).code, "WORKSPACE_SUSPENDED");
+  assert.equal(suspendedLogin.headers.get("set-cookie"), null, "suspended login does not issue a session cookie");
   const revokedLicenseHeartbeatBody = JSON.stringify({ metrics: { cpuPercent: 1 } });
   const revokedLicenseTimestamp = String(Date.now());
   const revokedLicenseNonce = "revoked-license-agent-nonce-0001";
   const revokedLicenseSignature = sign("sha256", Buffer.concat([Buffer.from(`${revokedLicenseTimestamp}\n${revokedLicenseNonce}\n`), Buffer.from(revokedLicenseHeartbeatBody)]), customerBDeviceKeys.privateKey).toString("base64url");
   const revokedLicenseHeartbeat = await fetch(`${baseUrl}/api/agent/heartbeat`, { method: "POST", body: revokedLicenseHeartbeatBody, headers: { "Content-Type": "application/json", "x-device-id": customerBDeviceId, "x-device-timestamp": revokedLicenseTimestamp, "x-device-nonce": revokedLicenseNonce, "x-device-signature": revokedLicenseSignature } });
-  assert.equal(revokedLicenseHeartbeat.status, 200, "legacy license records do not disable an enrolled agent");
+  assert.equal(revokedLicenseHeartbeat.status, 403, "revocation immediately blocks enrolled agent authentication");
+  assert.equal((await revokedLicenseHeartbeat.json()).code, "WORKSPACE_SUSPENDED");
+  const legacyEnrollmentTimestamp = Date.now();
+  const legacyEnrollmentNonce = "legacy-after-suspension-nonce-01";
+  const legacyEnrollmentProof = sign("sha256", Buffer.from(`${customerBDeviceId}\n${legacyEnrollmentTimestamp}\n${legacyEnrollmentNonce}`), customerBDeviceKeys.privateKey).toString("base64url");
+  const legacyEnrollmentAfterRevoke = await fetch(`${baseUrl}/api/agent/enroll`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ deviceId: customerBDeviceId, name: "Customer B desktop", operatingSystem: "Windows 11", devicePublicKey: customerBDeviceKeys.publicKey.export({ type: "spki", format: "pem" }), clientNonce: legacyEnrollmentNonce, timestamp: legacyEnrollmentTimestamp, proofSignature: legacyEnrollmentProof }) });
+  assert.equal(legacyEnrollmentAfterRevoke.status, 403, "legacy unscoped enrollment cannot reassign or revive a suspended customer's existing device");
+  const legacyDeviceCheck = new DatabaseSync(dbPath);
+  assert.equal(legacyDeviceCheck.prepare("SELECT organization_id FROM devices WHERE id=?").get(customerBDeviceId).organization_id, customerBOrganizationId, "legacy enrollment leaves the device scoped to its original workspace");
+  legacyDeviceCheck.close();
+  const postRevokeEnrollmentKeys = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const postRevokeEnrollmentId = "a123456789abcdef0123456789abcdef";
+  const postRevokeNonce = "post-revoke-enroll-nonce-000001";
+  const postRevokeTimestamp = Date.now();
+  const postRevokeProof = sign("sha256", Buffer.from(`${customerBGrant.manifest.grantId}\n${postRevokeEnrollmentId}\n${postRevokeTimestamp}\n${postRevokeNonce}`), postRevokeEnrollmentKeys.privateKey).toString("base64url");
+  const postRevokeEnrollment = await fetch(`${baseUrl}/api/agent/enroll`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enrollmentGrant: customerBGrant, deviceId: postRevokeEnrollmentId, name: "suspended-workspace-device", operatingSystem: "Windows 11", devicePublicKey: postRevokeEnrollmentKeys.publicKey.export({ type: "spki", format: "pem" }), clientNonce: postRevokeNonce, timestamp: postRevokeTimestamp, proofSignature: postRevokeProof }) });
+  assert.equal(postRevokeEnrollment.status, 403, "signed-grant enrollment cannot bypass suspension");
+  assert.equal((await postRevokeEnrollment.json()).code, "WORKSPACE_SUSPENDED");
+  assert.equal((await fetch(`${baseUrl}/install/${suspendedInstallerId}`)).status, 404, "revocation hides the public installer page");
+  assert.equal((await fetch(`${baseUrl}/api/public-installers/${suspendedInstallerId}/msi`)).status, 404, "revocation blocks public package downloads");
+  assert.equal((await fetch(`${baseUrl}/install/${suspendedDownloadToken}`)).status, 404, "revocation hides a previously issued public download-link page");
+  assert.equal((await fetch(`${baseUrl}/api/public-installers/${suspendedDownloadToken}/msi`)).status, 404, "revocation blocks a previously issued token-based installer download");
+  assert.equal((await fetch(`${baseUrl}/api/installer-packages`, { method: "POST", headers: customerBHeaders, body: JSON.stringify({ generic: true }) })).status, 423, "suspended workspace cannot request installer generation");
+  const suspendedBuildDb = new DatabaseSync(dbPath);
+  const buildStatesAfterRevoke = suspendedBuildDb.prepare("SELECT status FROM installer_build_jobs WHERE organization_id=? ORDER BY id").all(customerBOrganizationId).map((row) => row.status);
+  assert.ok(buildStatesAfterRevoke.every((state) => state === "failed"), "queued and in-flight builds are failed transactionally on revocation");
+  const suspendedPackageState = suspendedBuildDb.prepare("SELECT build_status FROM installer_packages WHERE id=?").get("f".repeat(32));
+  assert.equal(suspendedPackageState.build_status, "failed");
+  const retainedCountsAfter = {
+    devices: suspendedBuildDb.prepare("SELECT COUNT(*) AS n FROM devices WHERE organization_id=?").get(customerBOrganizationId).n,
+    inventory: suspendedBuildDb.prepare("SELECT COUNT(*) AS n FROM software_inventory s JOIN devices d ON d.id=s.device_id WHERE d.organization_id=?").get(customerBOrganizationId).n,
+    deployments: suspendedBuildDb.prepare("SELECT COUNT(*) AS n FROM deployment_jobs WHERE organization_id=?").get(customerBOrganizationId).n,
+  };
+  assert.deepEqual(retainedCountsAfter, { devices: deviceCountBeforeRevocation, inventory: inventoryCountBeforeRevocation, deployments: deploymentCountBeforeRevocation }, "suspension preserves devices, inventory and deployment history");
+  const interruptedPackageState = suspendedBuildDb.prepare("SELECT build_status,msi_file,setup_file FROM installer_packages WHERE id=?").get(interruptedInstallerId);
+  assert.deepEqual({ ...interruptedPackageState }, { build_status: "failed", msi_file: null, setup_file: null }, "an upload interrupted by revocation does not attach or publish its artifact");
+  suspendedBuildDb.close();
+  const workerUploadAfterRevoke = await fetch(`${baseUrl}/api/installer-build-worker/jobs/${queuedBuildId}/msi`, { method: "PUT", headers: { ...workerHeaders, "Content-Type": "application/octet-stream" }, body: installerMsi });
+  assert.equal(workerUploadAfterRevoke.status, 410, "worker upload cannot publish an artifact after revocation");
+  assert.equal((await workerUploadAfterRevoke.json()).code, "WORKSPACE_SUSPENDED");
+  const workerFailureAfterRevoke = await fetch(`${baseUrl}/api/installer-build-worker/jobs/${queuedBuildId}/failed`, { method: "POST", headers: workerHeaders, body: JSON.stringify({ error: "simulated failure after revocation" }) });
+  assert.equal(workerFailureAfterRevoke.status, 410, "worker callbacks recheck entitlement after revocation");
+  const ownerLicenseView = await fetch(`${baseUrl}/api/licenses`, { headers: { Cookie: cookie } });
+  assert.equal(ownerLicenseView.status, 200, "platform owner retains license management access");
+  const ownerLicenses = await ownerLicenseView.json();
+  assert.equal(ownerLicenses.items.find((license) => license.id === licenseB.id)?.status, "revoked");
+  const ownerStatus = await fetch(`${baseUrl}/api/auth/status`, { headers: { Cookie: cookie } }).then((r) => r.json());
+  assert.equal(ownerStatus.administrator.licenseStatus, "unlicensed", "platform owner default workspace remains available without a customer license");
+  assert.equal((await fetch(`${baseUrl}/api/overview`, { headers: { Cookie: customerACookie } })).status, 200, "customer A remains accessible while customer B is suspended");
+  const customerCannotReactivate = await fetch(`${baseUrl}/api/licenses/${licenseB.id}/reactivate`, { method: "POST", headers: customerAHeaders, body: "{}" });
+  assert.equal(customerCannotReactivate.status, 403, "a customer cannot reactivate its own or another customer's license");
+  const stillRevoked = (await fetch(`${baseUrl}/api/licenses`, { headers: { Cookie: cookie } }).then((r) => r.json())).items.find((license) => license.id === licenseB.id);
+  assert.equal(stillRevoked.status, "revoked", "a non-owner reactivation attempt does not change license state");
+  const reactivateCustomerLicense = await fetch(`${baseUrl}/api/licenses/${licenseB.id}/reactivate`, { method: "POST", headers: adminHeaders });
+  assert.equal(reactivateCustomerLicense.status, 200, await reactivateCustomerLicense.clone().text());
+  const duplicateReactivation = await fetch(`${baseUrl}/api/licenses/${licenseB.id}/reactivate`, { method: "POST", headers: adminHeaders });
+  assert.equal(duplicateReactivation.status, 404, "an active license cannot be reactivated a second time");
+  const restoredLicense = (await fetch(`${baseUrl}/api/licenses`, { headers: { Cookie: cookie } }).then((r) => r.json())).items.find((license) => license.id === licenseB.id);
+  assert.equal(restoredLicense.status, "active", "owner reactivation restores the customer license");
+  const restoredDb = new DatabaseSync(dbPath);
+  const restoredLicenseRow = restoredDb.prepare("SELECT status,revoked_at,organization_id FROM licenses WHERE id=?").get(licenseB.id);
+  assert.equal(restoredLicenseRow.status, "active");
+  assert.equal(restoredLicenseRow.revoked_at, null);
+  assert.equal(restoredDb.prepare("SELECT status FROM installer_build_jobs WHERE organization_id=? AND id=?").get(customerBOrganizationId, interruptedBuildJobId).status, "failed", "reactivation never restarts a previously failed build");
+  assert.equal(restoredDb.prepare("SELECT build_status FROM installer_packages WHERE id=?").get(interruptedInstallerId).build_status, "failed", "reactivation never publishes a previously failed package");
+  assert.deepEqual({
+    devices: restoredDb.prepare("SELECT COUNT(*) AS n FROM devices WHERE organization_id=?").get(customerBOrganizationId).n,
+    inventory: restoredDb.prepare("SELECT COUNT(*) AS n FROM software_inventory s JOIN devices d ON d.id=s.device_id WHERE d.organization_id=?").get(customerBOrganizationId).n,
+    deployments: restoredDb.prepare("SELECT COUNT(*) AS n FROM deployment_jobs WHERE organization_id=?").get(customerBOrganizationId).n,
+  }, retainedCountsAfter, "reactivation preserves customer devices, inventory and deployment history");
+  restoredDb.close();
+  const reactivationAudit = await fetch(`${baseUrl}/api/audit`, { headers: { Cookie: cookie } }).then((r) => r.json());
+  assert.ok(reactivationAudit.items.some((event) => event.action === "license.reactivated" && event.targetId === licenseB.id && event.actor === "owner@example.test"), "owner reactivation is recorded in audit history");
+  assert.equal((await fetch(`${baseUrl}/api/overview`, { headers: { Cookie: customerBCookie } })).status, 200, "an existing customer session regains access after reactivation");
+  const customerBRelogin = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { ...origin, "Content-Type": "application/json" }, body: JSON.stringify({ email: "b@example.test", password: "customer-password-long-enough" }) });
+  assert.equal(customerBRelogin.status, 200, "customer can log in after license reactivation");
+  const customerBReloginCookie = customerBRelogin.headers.getSetCookie()[0].split(";")[0];
+  assert.equal((await fetch(`${baseUrl}/api/overview`, { headers: { Cookie: customerBReloginCookie } })).status, 200);
+  const restoredHeartbeatTimestamp = String(Date.now());
+  const restoredHeartbeatNonce = "restored-license-agent-nonce-0001";
+  const restoredHeartbeatSignature = sign("sha256", Buffer.concat([Buffer.from(`${restoredHeartbeatTimestamp}\n${restoredHeartbeatNonce}\n`), Buffer.from(revokedLicenseHeartbeatBody)]), customerBDeviceKeys.privateKey).toString("base64url");
+  const restoredHeartbeat = await fetch(`${baseUrl}/api/agent/heartbeat`, { method: "POST", body: revokedLicenseHeartbeatBody, headers: { "Content-Type": "application/json", "x-device-id": customerBDeviceId, "x-device-timestamp": restoredHeartbeatTimestamp, "x-device-nonce": restoredHeartbeatNonce, "x-device-signature": restoredHeartbeatSignature } });
+  assert.equal(restoredHeartbeat.status, 200, "approved customer agent regains authentication after reactivation");
   const customerARelogin = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { ...origin, "Content-Type": "application/json" }, body: JSON.stringify({ email: "a@example.test", password: "customer-password-long-enough" }) });
   assert.equal(customerARelogin.status, 200);
   const customerAReloginCookie = customerARelogin.headers.getSetCookie()[0].split(";")[0];
