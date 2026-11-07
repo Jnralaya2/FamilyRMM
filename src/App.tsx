@@ -13,7 +13,7 @@ import {
 type AuthInfo = { setupRequired: boolean; authenticated: boolean; purchaseContact: string; administrator: { id: string; email: string; role: string; organizationId: string; workspaceName: string; deviceLimit: number | null; sessionLimit: number | null; licenseStatus: string; suspended: boolean; licenseMessage: string | null } | null; csrfToken: string | null };
 type Device = { id: string; name: string; operatingSystem: string | null; osVersion: string | null; architecture: string | null; manufacturer: string | null; model: string | null; cpu: string | null; cpuCores: number | null; totalMemoryMB: number | null; ipAddresses: string[]; agentVersion: string | null; lastSeen: string | null; softwareInventoryAt?: string | null; enrolledAt: string; status: string; cpuUsagePercent?: number | null; memoryUsagePercent?: number | null };
 type Overview = { totalDevices: number; onlineDevices: number; offlineDevices: number; revokedDevices: number; lastCheckIn: string | null; performance: { hour: string; cpu: number | null; memory: number | null }[] };
-type Page = "overview" | "devices" | "deployments" | "enrollment" | "downloads" | "audit" | "licenses" | "screenconnect";
+type Page = "overview" | "devices" | "deployments" | "enrollment" | "downloads" | "audit" | "licenses" | "screenconnect" | "settings";
 type Health = { status: "ok" | "degraded"; database: "connected" | "unavailable"; checkedAt: string };
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -40,7 +40,6 @@ export default function App() {
   const [healthInfo, setHealthInfo] = useState<Health | null>(null);
   const [page, setPage] = useState<Page>("overview");
   const [toast, setToast] = useState("");
-  const [helpOpen, setHelpOpen] = useState(false);
 
   const refreshAuth = useCallback(async () => {
     try { setAuth(await request<AuthInfo>("/api/auth/status")); setAuthError(""); }
@@ -84,6 +83,10 @@ export default function App() {
         {isPlatformOwner && <button aria-label="Customer licenses" className={`nav-item ${page === "licenses" ? "selected" : ""}`} onClick={() => setPage("licenses")}><ShieldCheck size={17} /><span>Customer licenses</span></button>}
         <button aria-label="ScreenConnect instances" className={`nav-item ${page === "screenconnect" ? "selected" : ""}`} onClick={() => setPage("screenconnect")}><Server size={17} /><span>ScreenConnect</span></button>
       </nav>
+      <div className="nav-label">SUPPORT</div>
+      <nav className="main-nav" aria-label="Settings and help">
+        <button aria-label="Settings and help" className={`nav-item ${page === "settings" ? "selected" : ""}`} onClick={() => setPage("settings")}><SlidersHorizontal size={17} /><span>Settings &amp; help</span></button>
+      </nav>
       <div className="sidebar-bottom">
         <div className="connection-card"><div className={`connection-dot ${health}`} /><span><strong>{health === "ok" ? "Server connected" : health === "error" ? "Connection issue" : "Connecting"}</strong><small>{health === "ok" ? "Family RMM service" : "Checking service"}</small></span><Wifi size={15} /></div>
         <button className="profile" onClick={onLogout} title="Sign out"><div className="profile-avatar">{auth.administrator?.email.slice(0, 1).toUpperCase()}</div><span><strong>{auth.administrator?.email}</strong><small>{isPlatformOwner ? "Platform owner" : "Workspace owner"}</small></span><LogOut size={16} /></button>
@@ -92,16 +95,54 @@ export default function App() {
 
     <main className="main-area">
       <header className="topbar">
-        <div className="breadcrumbs"><span>{auth.administrator?.workspaceName}</span><span className="crumb-sep">/</span><strong>{page === "overview" ? "Overview" : page === "devices" ? "Devices" : page === "deployments" ? "Software & deployments" : page === "enrollment" ? "Enrollment" : page === "downloads" ? "Windows downloads" : page === "licenses" ? "Customer licenses" : page === "screenconnect" ? "ScreenConnect" : "Audit log"}</strong></div>
-        <div className="topbar-actions"><span className="environment-tag"><span />{health === "ok" ? "SERVICE ONLINE" : health === "error" ? "SERVICE ISSUE" : "CONNECTING"}</span><button className="icon-button" title="Help" onClick={() => setHelpOpen(true)}><CircleHelp size={17} /></button><span className="top-avatar" aria-label="Current administrator">{auth.administrator?.email.slice(0, 1).toUpperCase()}</span></div>
+        <div className="breadcrumbs"><span>{auth.administrator?.workspaceName}</span><span className="crumb-sep">/</span><strong>{page === "overview" ? "Overview" : page === "devices" ? "Devices" : page === "deployments" ? "Software & deployments" : page === "enrollment" ? "Enrollment" : page === "downloads" ? "Windows downloads" : page === "licenses" ? "Customer licenses" : page === "screenconnect" ? "ScreenConnect" : page === "settings" ? "Settings & help" : "Audit log"}</strong></div>
+        <div className="topbar-actions"><span className="environment-tag"><span />{health === "ok" ? "SERVICE ONLINE" : health === "error" ? "SERVICE ISSUE" : "CONNECTING"}</span><button className="icon-button" title="Settings and help" aria-label="Settings and help" onClick={() => setPage("settings")}><CircleHelp size={17} /></button><span className="top-avatar" aria-label="Current administrator">{auth.administrator?.email.slice(0, 1).toUpperCase()}</span></div>
       </header>
       <div className="page-content">
-        {page === "overview" ? <OverviewPage onOpenDevices={() => setPage("devices")} onOpenEnrollment={() => setPage("enrollment")} showOwnerInstallers={isPlatformOwner} csrfToken={auth.csrfToken || ""} health={healthInfo} /> : page === "devices" ? <DevicesPage onNotice={showToast} /> : page === "deployments" && canDeploy ? <DeploymentsPage csrfToken={auth.csrfToken || ""} onNotice={showToast} /> : page === "enrollment" ? <EnrollmentPage csrfToken={auth.csrfToken || ""} onNotice={showToast} /> : page === "downloads" ? <WindowsDownloadsPage csrfToken={auth.csrfToken || ""} onNotice={showToast} /> : page === "licenses" && isPlatformOwner ? <LicenseManagement csrfToken={auth.csrfToken || ""} onNotice={showToast} /> : page === "screenconnect" ? <ScreenConnectPage csrfToken={auth.csrfToken || ""} onNotice={showToast} /> : <AuditPage />}
+        {page === "overview" ? <OverviewPage onOpenDevices={() => setPage("devices")} onOpenEnrollment={() => setPage("enrollment")} showOwnerInstallers={isPlatformOwner} csrfToken={auth.csrfToken || ""} health={healthInfo} /> : page === "devices" ? <DevicesPage onNotice={showToast} /> : page === "deployments" && canDeploy ? <DeploymentsPage csrfToken={auth.csrfToken || ""} onNotice={showToast} /> : page === "enrollment" ? <EnrollmentPage csrfToken={auth.csrfToken || ""} onNotice={showToast} /> : page === "downloads" ? <WindowsDownloadsPage csrfToken={auth.csrfToken || ""} onNotice={showToast} /> : page === "licenses" && isPlatformOwner ? <LicenseManagement csrfToken={auth.csrfToken || ""} onNotice={showToast} /> : page === "screenconnect" ? <ScreenConnectPage csrfToken={auth.csrfToken || ""} onNotice={showToast} /> : page === "settings" ? <SettingsHelpPage administrator={auth.administrator!} health={health} healthInfo={healthInfo} isPlatformOwner={isPlatformOwner} canDeploy={canDeploy} onNavigate={setPage} /> : <AuditPage />}
       </div>
     </main>
     {toast && <div className="toast" role="status"><ShieldCheck size={16} />{toast}</div>}
-    {helpOpen && <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && setHelpOpen(false)}><section className="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-title"><button className="icon-button modal-close" onClick={() => setHelpOpen(false)} aria-label="Close help"><X size={18} /></button><div className="empty-icon"><CircleHelp size={19} /></div><h2 id="help-title">Operations console</h2><p>This first release includes the live Overview and Devices inventory, backed by the local RMM API and database.</p><div className="help-note"><ShieldCheck size={16} /><span>Only real agent check-ins appear here. No sample devices are inserted.</span></div><button className="primary-button" onClick={() => setHelpOpen(false)}>Close</button></section></div>}
   </div>;
+}
+
+function SettingsHelpPage({ administrator, health, healthInfo, isPlatformOwner, canDeploy, onNavigate }: { administrator: NonNullable<AuthInfo["administrator"]>; health: "checking" | "ok" | "error"; healthInfo: Health | null; isPlatformOwner: boolean; canDeploy: boolean; onNavigate: (page: Page) => void }) {
+  const shortcuts: { label: string; detail: string; icon: ReactNode; page: Page }[] = [
+    { label: "Enrollment & approvals", detail: "Control how new computers join your workspace.", icon: <BadgePlus size={16} />, page: "enrollment" },
+    { label: "Windows downloads", detail: "Get the FamilyRMM agent installer.", icon: <Download size={16} />, page: "downloads" },
+    { label: "ScreenConnect", detail: "View saved ScreenConnect instance details.", icon: <Server size={16} />, page: "screenconnect" },
+    ...(canDeploy ? [{ label: "Software & deployments", detail: "Manage packages, scripts and device tasks.", icon: <Package size={16} />, page: "deployments" as Page }] : []),
+    ...(isPlatformOwner ? [{ label: "Customer licenses", detail: "Issue, revoke or reactivate customer licenses.", icon: <ShieldCheck size={16} />, page: "licenses" as Page }] : []),
+  ];
+  return <>
+    <div className="page-heading"><div><div className="eyebrow">PREFERENCES &amp; SUPPORT</div><h1>Settings &amp; help</h1><p>Workspace details, setup guidance, and shortcuts to settings.</p></div></div>
+    <div className="settings-grid">
+      <section className="panel settings-panel">
+        <div className="panel-heading"><div><h2>Account &amp; workspace</h2><p>Your current FamilyRMM access</p></div><ShieldCheck size={17} /></div>
+        <dl className="settings-details">
+          <div><dt>Workspace</dt><dd>{administrator.workspaceName}</dd></div>
+          <div><dt>Signed-in account</dt><dd>{administrator.email}</dd></div>
+          <div><dt>Access role</dt><dd>{administrator.role.replaceAll("_", " ")}</dd></div>
+          <div><dt>License</dt><dd>{administrator.licenseStatus || "Not reported"}</dd></div>
+          <div><dt>Service</dt><dd>{health === "ok" ? "Online" : health === "error" ? "Connection issue" : "Checking"}{healthInfo?.database ? ` · database ${healthInfo.database}` : ""}</dd></div>
+        </dl>
+        <p className="settings-footnote">Account email and workspace name are shown here. Changing them is not currently available in the dashboard.</p>
+      </section>
+      <section className="panel settings-panel">
+        <div className="panel-heading"><div><h2>Manage your workspace</h2><p>Open the area for the setting you need.</p></div><SlidersHorizontal size={17} /></div>
+        <div className="settings-shortcuts">{shortcuts.map((item) => <button className="settings-shortcut" key={item.page} onClick={() => onNavigate(item.page)}><span className="settings-shortcut-icon">{item.icon}</span><span><strong>{item.label}</strong><small>{item.detail}</small></span><ChevronRight size={15} /></button>)}</div>
+      </section>
+      <section className="panel settings-panel settings-wide">
+        <div className="panel-heading"><div><h2>Common questions</h2><p>Quick guidance for everyday device management</p></div><CircleHelp size={17} /></div>
+        <div className="settings-help-list">
+          <article><h3>A computer shows Offline</h3><p>It must be powered on, connected to the internet, and running the FamilyRMM agent. Offline devices cannot receive a queued task until they check in again.</p></article>
+          <article><h3>A new install is not managed yet</h3><p>Check Enrollment for a pending approval. A device becomes managed only after it is approved or allowed by the active enrollment policy.</p></article>
+          <article><h3>ScreenConnect</h3><p>The current release can save ScreenConnect instance details, but ScreenConnect deployment and session integration are not available yet. A link containing <code>?Session=</code> is a temporary support-session link, not an Access installer.</p></article>
+          <article><h3>Server settings</h3><p>Credentials and other server configuration are managed outside the dashboard. Keep secrets in private server configuration, never in customer installers or browser pages.</p></article>
+        </div>
+      </section>
+    </div>
+  </>;
 }
 
 function AuthScreen({ setupRequired, purchaseContact, onSuccess }: { setupRequired: boolean; purchaseContact: string; onSuccess: () => Promise<void> }) {
