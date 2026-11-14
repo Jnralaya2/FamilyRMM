@@ -12,7 +12,9 @@
     <PublishSingleFile>true</PublishSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
-    <Version>0.2.4</Version>
+    <Version>0.4.5</Version>
+    <UseWindowsForms>true</UseWindowsForms>
+    <GuardExe Condition="'$(GuardExe)' == ''">$(MSBuildProjectDirectory)\..\publish\guard\FamilyRmm.Guard.exe</GuardExe>
     <AgentConfigPath Condition="'$(AgentConfigPath)' == ''">$(MSBuildProjectDirectory)\rmm-agent.example.json</AgentConfigPath>
   </PropertyGroup>
 
