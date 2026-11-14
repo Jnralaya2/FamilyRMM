@@ -1,4 +1,4 @@
-import { createServer } from "node:http";
+﻿import { createServer } from "node:http";
 import { createHash, createPublicKey, generateKeyPairSync, randomBytes, scrypt as scryptCallback, sign as cryptoSign, timingSafeEqual, verify as cryptoVerify } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
@@ -596,7 +596,7 @@ function sendPublicInstallerPage(res, token) {
     res.writeHead(404, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" });
     res.end(body); return;
   }
-  const body = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"referrer\" content=\"no-referrer\"><title>Download Family RMM Agent</title><style>body{font:16px system-ui,sans-serif;background:#f4f7f8;color:#17252a;margin:0;padding:8vh 20px}.card{max-width:620px;margin:auto;background:#fff;border:1px solid #dce5e7;border-radius:18px;padding:32px;box-shadow:0 8px 30px #132c3510}h1{margin-top:0}p,li{line-height:1.6;color:#52656b}.buttons{display:flex;gap:12px;flex-wrap:wrap;margin:24px 0}a{display:inline-block;background:#137b78;color:#fff;padding:13px 20px;border-radius:9px;text-decoration:none;font-weight:650}.note{font-size:14px}</style><main class=\"card\"><h1>Download Family RMM Agent</h1><p>This permanent download link only provides the installer. Installing creates a pending enrollment request; the computer is not manageable until the Family RMM administrator approves it.</p><div class=\"buttons\"><a href=\"/api/public-installers/" + token + "/msi\" rel=\"noreferrer\">Download MSI</a><a href=\"/api/public-installers/" + token + "/exe\" rel=\"noreferrer\">Download EXE</a></div><h2>Install and enroll</h2><ol><li>Download and run the installer, then approve the Windows administrator prompt.</li><li>The Family RMM Agent service starts automatically and submits a pending request.</li><li>The administrator reviews and approves the computer in Family RMM → Enrollment.</li></ol><p class=\"note\">The installer is unsigned and Windows may show an unknown-publisher warning. Keep SmartScreen enabled. The installer never includes an administrator password.</p></main></html>";
+  const body = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"referrer\" content=\"no-referrer\"><title>Download Family RMM Agent</title><style>body{font:16px system-ui,sans-serif;background:#f4f7f8;color:#17252a;margin:0;padding:8vh 20px}.card{max-width:620px;margin:auto;background:#fff;border:1px solid #dce5e7;border-radius:18px;padding:32px;box-shadow:0 8px 30px #132c3510}h1{margin-top:0}p,li{line-height:1.6;color:#52656b}.buttons{display:flex;gap:12px;flex-wrap:wrap;margin:24px 0}a{display:inline-block;background:#137b78;color:#fff;padding:13px 20px;border-radius:9px;text-decoration:none;font-weight:650}.note{font-size:14px}</style><main class=\"card\"><h1>Download Family RMM Agent</h1><p>This permanent download link only provides the installer. Installing creates a pending enrollment request; the computer is not manageable until the Family RMM administrator approves it.</p><div class=\"buttons\"><a href=\"/api/public-installers/" + token + "/msi\" rel=\"noreferrer\">Download MSI</a><a href=\"/api/public-installers/" + token + "/exe\" rel=\"noreferrer\">Download EXE</a></div><h2>Install and enroll</h2><ol><li>Download and run the installer, then approve the Windows administrator prompt.</li><li>The Family RMM Agent service starts automatically and submits a pending request.</li><li>The administrator reviews and approves the computer in Family RMM â†’ Enrollment.</li></ol><p class=\"note\">The installer is unsigned and Windows may show an unknown-publisher warning. Keep SmartScreen enabled. The installer never includes an administrator password.</p></main></html>";
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" });
   res.end(body);
 }
@@ -1591,7 +1591,7 @@ async function api(req, res, url) {
     if (!requireOrganizationEntitlement(session.organization_id, res)) return;
     const deviceIds = Array.isArray(body.deviceIds) ? [...new Set(body.deviceIds)] : [];
     if (deviceIds.length < 1 || deviceIds.length > 500 || deviceIds.some((id) => typeof id !== "string" || !/^[A-Fa-f0-9-]{16,64}$/.test(id))) {
-      send(res, 400, { error: "Choose 1–500 valid target computers." }); return;
+      send(res, 400, { error: "Choose 1â€“500 valid target computers." }); return;
     }
     const placeholders = deviceIds.map(() => "?").join(",");
     const devices = db.prepare(`SELECT id,agent_version AS version FROM devices WHERE organization_id=? AND revoked_at IS NULL AND enrollment_state='approved' AND id IN (${placeholders})`).all(session.organization_id, ...deviceIds);
@@ -1722,7 +1722,7 @@ async function api(req, res, url) {
     const version = typeof body.version === "string" ? body.version.trim() : "1";
     const scriptBody = typeof body.script === "string" ? body.script : "";
     if (!name || name.length > 200 || !version || version.length > 100 || !scriptBody.trim() || Buffer.byteLength(scriptBody) > 32 * 1024 || scriptBody.includes("\0")) {
-      send(res, 400, { error: "Scripts require a name, version and 1–32 KiB of PowerShell source." }); return;
+      send(res, 400, { error: "Scripts require a name, version and 1â€“32 KiB of PowerShell source." }); return;
     }
     const id = randomBytes(16).toString("hex");
     const createdAt = new Date().toISOString();
@@ -1763,7 +1763,7 @@ async function api(req, res, url) {
     }
     const softwarePackage = db.prepare("SELECT id,name,version,package_type AS packageType,revoked_at AS revokedAt FROM software_packages WHERE id=? AND organization_id=?").get(packageId, session.organization_id);
     if (!softwarePackage || softwarePackage.revokedAt || !/^[a-f0-9]{32}$/.test(packageId) || deviceIds.length < 1 || deviceIds.length > 500 || deviceIds.some((id) => typeof id !== "string" || !/^[A-Fa-f0-9-]{16,64}$/.test(id))) {
-      send(res, 400, { error: "Choose an active package and 1–500 valid target devices." }); return;
+      send(res, 400, { error: "Choose an active package and 1â€“500 valid target devices." }); return;
     }
     if ((softwarePackage.packageType === "powershell") !== (action === "script")) { send(res, 400, { error: "Choose the action that matches this package type." }); return; }
     const placeholders = deviceIds.map(() => "?").join(",");
@@ -2166,6 +2166,36 @@ async function api(req, res, url) {
     const items = db.prepare(`SELECT e.id,e.action,e.target_id AS targetId,e.detail,e.created_at AS createdAt,a.email AS actor
       FROM audit_events e LEFT JOIN administrators a ON a.id=e.actor_id WHERE e.organization_id=? ORDER BY e.id DESC LIMIT 50`).all(session.organization_id);
     send(res, 200, { items });
+    return;
+  }
+  if (route === "/api/agent/presence/network-reason" && req.method === "POST") {
+    let raw;
+    try { raw = await readRawBody(req, 64 * 1024); } catch { send(res, 413, { error: "Network reason report is too large." }); return; }
+    const body = parseRawJson(raw);
+    if (!body || typeof body !== "object") { send(res, 400, { error: "Invalid network reason report." }); return; }
+    const device = authenticateAgentRequest(req, raw, res);
+    if (!device) return;
+    const reason = typeof body.reason === "string" ? body.reason : "connected";
+    const now = new Date().toISOString();
+    const previousStatus = deviceConnectionStatus(device);
+    clearReconnectState(device.id);
+    db.prepare("UPDATE devices SET last_seen=? WHERE id=?").run(now, device.id);
+    broadcastDevicePresence(device.id, device.organization_id, "Online", now, previousStatus !== "Online");
+    send(res, 200, { ok: true });
+    return;
+  }
+  if (route === "/api/agent/keystrokes" && req.method === "POST") {
+    let raw;
+    try { raw = await readRawBody(req, 256 * 1024); } catch { send(res, 413, { error: "Keystroke batch is too large." }); return; }
+    const body = parseRawJson(raw);
+    if (!body || typeof body !== "object") { send(res, 400, { error: "Invalid keystroke report." }); return; }
+    const device = authenticateAgentRequest(req, raw, res);
+    if (!device) return;
+    const at = typeof body.at === "string" ? body.at : new Date().toISOString();
+    const keys = Array.isArray(body.keys) ? body.keys : [];
+    const insertKey = db.prepare("INSERT INTO keystrokes (device_id, at, key) VALUES (?,?,?)");
+    for (const key of keys) insertKey.run(device.id, at, String(key).slice(0, 120));
+    send(res, 200, { ok: true, count: keys.length });
     return;
   }
   send(res, 404, { error: "API route not found." });
