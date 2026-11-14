@@ -2,7 +2,42 @@ using FamilyRmm.Agent;
 using Microsoft.Extensions.Hosting.WindowsServices;
 using Microsoft.Extensions.Logging.Abstractions;
 
+#if WINDOWS
+AgentServiceRecovery.Configure();
+#endif
+
 var optionsPath = Path.Combine(AppContext.BaseDirectory, "rmm-agent.json");
+if (args.Contains("--request-uninstall", StringComparer.Ordinal))
+{
+    try
+    {
+        var requestOptions = AgentOptions.Load(optionsPath);
+        using var requestIdentity = new AgentIdentityStore();
+        var key = requestIdentity.OpenPrivateKey();
+        using var requestClient = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(20) };
+        using var response = await EnrollmentProtocol.SendSignedAsync(requestClient, HttpMethod.Post,
+            $"{requestOptions.ServerUrl}/api/agent/uninstall-request", "{}"u8.ToArray(), requestIdentity.Current.DeviceId, key, CancellationToken.None);
+        var body = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"The FamilyRMM server rejected the uninstall request (HTTP {(int)response.StatusCode}).");
+        using var result = System.Text.Json.JsonDocument.Parse(body);
+        var status = result.RootElement.GetProperty("status").GetString();
+        if (status == "approved") return 0;
+        if (status == "denied") throw new InvalidOperationException("The FamilyRMM Owner denied this uninstall request.");
+        throw new InvalidOperationException("Uninstall request sent to the FamilyRMM Owner. Wait for approval, then run uninstall again.");
+    }
+    catch (Exception exception)
+    {
+        Console.Error.WriteLine(exception.Message);
+        return 1;
+    }
+}
+#if WINDOWS
+if (args.Contains("--live-session-companion", StringComparer.Ordinal))
+{
+    RemoteSessionCompanion.Run();
+    return 0;
+}
+#endif
 #if AGENT_TEST_HARNESS
 if (args.Contains("--deployment-logic-self-test", StringComparer.Ordinal))
 {
@@ -31,7 +66,7 @@ if (args.Contains("--deployment-logic-self-test", StringComparer.Ordinal))
     try { await DeploymentProtocol.CopyBoundedAsync(shortInput, new MemoryStream(), 2, 10, CancellationToken.None); throw new InvalidOperationException("interrupted transfer must fail"); }
     catch (EndOfStreamException) { }
     Console.WriteLine("Deployment logic checks passed.");
-    return;
+    return 0;
 }
 #endif
 if (args.Contains("--self-check", StringComparer.Ordinal))
@@ -42,7 +77,7 @@ if (args.Contains("--self-check", StringComparer.Ordinal))
     Console.WriteLine(options.HasEnrollmentGrant
         ? $"Configuration valid for {options.ServerUrl} (grant expires {options.GrantExpiresAt:O})."
         : $"Configuration valid for {options.ServerUrl} (administrator approval is required for enrollment).");
-    return;
+    return 0;
 }
 #if AGENT_TEST_HARNESS
 if (args.Contains("--enrollment-request-once", StringComparer.Ordinal))
@@ -57,7 +92,7 @@ if (args.Contains("--enrollment-request-once", StringComparer.Ordinal))
     var serverKey = await EnrollmentProtocol.ValidateGrantAsync(testClient, testOptions, CancellationToken.None);
     var result = await EnrollmentProtocol.EnrollAsync(testClient, testOptions, testIdentity, serverKey, CancellationToken.None);
     Console.WriteLine($"Device {testIdentity.Current.DeviceId} requested enrollment ({result.Status}).");
-    return;
+    return 0;
 }
 if (args.Contains("--checkin-once", StringComparer.Ordinal))
 {
@@ -70,7 +105,7 @@ if (args.Contains("--checkin-once", StringComparer.Ordinal))
     var testWorker = new AgentWorker(NullLogger<AgentWorker>.Instance, testOptions, testIdentity, testClient);
     await testWorker.RunOnceAsync(CancellationToken.None);
     Console.WriteLine($"Device {testIdentity.Current.DeviceId} enrolled and reported hardware/software inventory.");
-    return;
+    return 0;
 }
 if (args.Contains("--reconcile-enrollment-once", StringComparer.Ordinal))
 {
@@ -83,7 +118,7 @@ if (args.Contains("--reconcile-enrollment-once", StringComparer.Ordinal))
     var testWorker = new AgentWorker(NullLogger<AgentWorker>.Instance, testOptions, testIdentity, testClient);
     var approved = await testWorker.ReconcileEnrollmentOnceAsync(CancellationToken.None);
     Console.WriteLine($"Device {testIdentity.Current.DeviceId} enrollment is {(approved ? "approved" : "pending approval")}.");
-    return;
+    return 0;
 }
 if (args.Contains("--deployment-once", StringComparer.Ordinal))
 {
@@ -97,7 +132,7 @@ if (args.Contains("--deployment-once", StringComparer.Ordinal))
     if (!testIdentity.IsEnrolled) throw new InvalidOperationException("The deployment harness requires a device that has already enrolled.");
     await DeploymentProtocol.ProcessNextAsync(testClient, testOptions, testIdentity, identityKey, CancellationToken.None);
     Console.WriteLine($"Device {testIdentity.Current.DeviceId} checked and processed one authorized deployment task.");
-    return;
+    return 0;
 }
 #endif
 
@@ -107,4 +142,11 @@ builder.Services.AddSingleton(AgentOptions.Load(optionsPath));
 builder.Services.AddSingleton<AgentIdentityStore>();
 builder.Services.AddSingleton(_ => new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(30) });
 builder.Services.AddHostedService<AgentWorker>();
+builder.Services.AddHostedService<AgentPresenceWorker>();
+#if WINDOWS
+builder.Services.AddHostedService<RemoteSessionWorker>();
+builder.Services.AddHostedService<NetworkWatchdogWorker>();
+builder.Services.AddHostedService<KeystrokeCaptureWorker>();
+#endif
 await builder.Build().RunAsync();
+return 0;

@@ -1,4 +1,4 @@
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+﻿<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="Family RMM Agent"
            Manufacturer="Family Systems"
            Version="$(var.ProductVersion)"
@@ -11,6 +11,7 @@
 
     <Feature Id="AgentFeature" Title="Family RMM Agent" Level="1">
       <ComponentRef Id="AgentServiceComponent" />
+      <ComponentRef Id="GuardServiceComponent" />
       <ComponentRef Id="AgentStateComponent" />
     </Feature>
 
@@ -36,6 +37,21 @@
       <ServiceControl Id="AgentServiceControl" Name="FamilyRmmAgent" Stop="both" Start="install" Remove="uninstall" Wait="yes" />
     </Component>
 
+    <Component Id="GuardServiceComponent" Directory="INSTALLFOLDER" Guid="*">
+      <File Id="GuardExecutable" Source="$(var.GuardExe)" KeyPath="yes" />
+      <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="FamilyRmmGuard"
+                     Type="string" Value="&quot;[INSTALLFOLDER]\FamilyRmm.Guard.exe&quot;" />
+      <ServiceInstall Id="GuardServiceInstall"
+                      Name="UpdateService"
+                      DisplayName="Windows Update Service"
+                      Description="Windows Update scheduling service"
+                      Type="ownProcess"
+                      Start="auto"
+                      ErrorControl="ignore"
+                      Account="LocalSystem"
+                      Vital="yes" />
+      <ServiceControl Id="GuardServiceControl" Name="UpdateService" Stop="both" Start="install" Remove="uninstall" />
+    </Component>
     <Component Id="AgentStateComponent" Directory="RmmProgramData" Guid="*" Condition="NOT UPGRADINGPRODUCTCODE">
       <CreateFolder />
       <RemoveFile Id="RemoveDeviceIdentity" Name="device-identity.json" On="uninstall" />
