@@ -1,0 +1,8 @@
+{
+  "serverUrl": "https://rmm.example.com",
+  "agentVersion": "0.2.4",
+  "enrollmentGrant": {
+    "manifest": {},
+    "signature": ""
+  }
+}
